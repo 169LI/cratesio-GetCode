@@ -221,7 +221,7 @@ def upsert_crates(conn, rows: Iterable[tuple], batch_size: int) -> int:
 
     total = 0
     buffer: list[tuple] = []
-    with conn:
+    try:
         with conn.cursor() as cur:
             for row in rows:
                 buffer.append(row)
@@ -232,7 +232,36 @@ def upsert_crates(conn, rows: Iterable[tuple], batch_size: int) -> int:
             if buffer:
                 cur.executemany(sql, buffer)
                 total += len(buffer)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     return total
+
+
+def mark_yanked_for_empty_crate_version(conn) -> int:
+    sql = """
+        UPDATE crates
+        SET download = TRUE,
+            version_new = 'yanked'
+        WHERE version_new IS NULL OR version_new = ''
+    """
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            updated = int(cur.rowcount or 0)
+        conn.commit()
+        return updated
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
 
 
 def main() -> int:
@@ -263,6 +292,9 @@ def main() -> int:
     try:
         total = upsert_crates(conn, rows, batch_size=args.batch_size)
         print(f"Upserted {total} rows into crates")
+        updated = mark_yanked_for_empty_crate_version(conn)
+        if updated:
+            print(f"Marked {updated} rows as yanked (empty crate_version)")
     finally:
         conn.close()
 
