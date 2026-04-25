@@ -15,7 +15,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use datahandle::entities::crates;
+use sea_orm::{
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect,
+};
 
 #[derive(Clone, Debug)]
 pub struct PgDataHandle {
@@ -41,5 +45,50 @@ impl PgDataHandle {
 
     pub fn get_connection(&self) -> &DatabaseConnection {
         &self.connection
+    }
+
+    /// 获取需要下载源码的 crate 列表
+    pub async fn get_unfetched_crates(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<crates::Model>, sea_orm::DbErr> {
+        crates::Entity::find()
+            .filter(crates::Column::Download.eq(false))
+            .filter(crates::Column::DownloadFailed.eq(false))
+            .filter(crates::Column::VersionNew.is_not_null())
+            .filter(crates::Column::VersionNew.ne("yanked"))
+            .filter(crates::Column::VersionNew.ne(""))
+            .limit(limit)
+            .all(self.get_connection())
+            .await
+    }
+
+    /// 标记 crate 下载成功
+    pub async fn mark_crate_downloaded(&self, id: i32) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::Download,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .col_expr(
+                crates::Column::DownloadFailed,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_crate_download_failed(&self, id: i32) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::DownloadFailed,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
     }
 }

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+datahandle = { path = "../datahandle" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+flate2 = "1"
+tar = "0.4"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"

@@ -4,3 +4,4 @@ logs/
 .vscode/
 .trae/
 __pycache__/
+/mkdir/

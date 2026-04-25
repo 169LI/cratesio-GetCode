@@ -52,7 +52,15 @@ pub fn get_config_once(_load: &ConfigLoad) -> anyhow::Result<&'static Config> {
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_env = manifest_dir.parent().unwrap_or(&manifest_dir).join(".env");
-    let _ = dotenvy::from_path(workspace_env);
+    if workspace_env.exists() {
+        dotenvy::from_path(&workspace_env).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load dotenv from {}: {}",
+                workspace_env.display(),
+                e
+            )
+        })?;
+    }
     let env = std::env::vars().collect::<HashMap<_, _>>();
 
     let _ = CONFIG.set(Config { env });

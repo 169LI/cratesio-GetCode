@@ -25,16 +25,18 @@ mod pgdatahandle;
 use clap::Parser;
 use cli::{Cli, Commands};
 use commands::{build, download};
+use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
     let config = config::get_config_once(&config::ConfigLoad::new())?;
     let database_url = config.require("DATABASE_URL")?;
+    let download_dir = PathBuf::from(config.require("DOWNLOAD_DIR")?);
     let db = pgdatahandle::PgDataHandle::new(&database_url).await?;
 
     match cli.command {
-        Commands::Download => download::download_run(&db).await?,
+        Commands::Download => download::download_run(&db, &download_dir).await?,
         Commands::Build => build::build_run(&db).await?,
     }
 

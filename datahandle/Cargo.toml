@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 dotenvy = "0.15"
 sea-orm = { version = "1", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres"] }
+serde = { version = "1.0.228", features = ["derive"] }

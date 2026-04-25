@@ -11,6 +11,10 @@
 //! -
 //! - 读取 `RUST_LOG`（例如 `RUST_LOG=debug`）
 //! - 未设置时默认 `info`
+//! - 级别效果示例：
+//!   - `RUST_LOG=debug`：输出 debug/info/warn/error
+//!   - `RUST_LOG=info`：输出 info/warn/error（不输出 debug）
+//!   - `RUST_LOG=warn`：仅输出 warn/error
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

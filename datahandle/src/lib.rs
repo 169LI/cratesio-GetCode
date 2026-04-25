@@ -1,3 +1,5 @@
+pub mod entities;
+
 use dotenvy::dotenv;
 use sea_orm::{Database, DatabaseConnection};
 

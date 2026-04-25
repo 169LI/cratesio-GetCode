@@ -22,6 +22,7 @@ pub struct Model {
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub version_new: String,
+    pub download_failed: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -34,6 +35,7 @@ pub enum Column {
     CreatedAt,
     UpdatedAt,
     VersionNew,
+    DownloadFailed,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -63,6 +65,7 @@ impl ColumnTrait for Column {
             Self::CreatedAt => ColumnType::DateTime.def(),
             Self::UpdatedAt => ColumnType::DateTime.def(),
             Self::VersionNew => ColumnType::String(StringLen::None).def(),
+            Self::DownloadFailed => ColumnType::Boolean.def(),
         }
     }
 }
