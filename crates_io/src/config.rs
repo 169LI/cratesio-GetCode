@@ -66,3 +66,41 @@ pub fn get_config_once(_load: &ConfigLoad) -> anyhow::Result<&'static Config> {
     let _ = CONFIG.set(Config { env });
     Ok(CONFIG.get().expect("config must be initialized"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_download_dir_exists() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_env = manifest_dir.parent().unwrap_or(&manifest_dir).join(".env");
+        assert!(
+            workspace_env.exists(),
+            "workspace .env not found: {}",
+            workspace_env.display()
+        );
+
+        dotenvy::from_path(&workspace_env).unwrap_or_else(|e| {
+            panic!(
+                "failed to load dotenv from {}: {}",
+                workspace_env.display(),
+                e
+            )
+        });
+
+        let download_dir_raw = std::env::var("DOWNLOAD_DIR").unwrap_or_else(|_| {
+            panic!(
+                "missing env: DOWNLOAD_DIR (loaded from {})",
+                workspace_env.display()
+            )
+        });
+        let download_dir = PathBuf::from(download_dir_raw);
+
+        assert!(
+            download_dir.is_dir(),
+            "DOWNLOAD_DIR must be an existing directory: {}",
+            download_dir.display()
+        );
+    }
+}
