@@ -1,0 +1,12 @@
+[package]
+name = "datahandle-migration"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dotenvy = "0.15"
+sea-orm-migration = { version = "1", features = [
+    "runtime-tokio-rustls",
+    "sqlx-postgres",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,6 @@
+.idea/
+target/
+logs/
+.vscode/
+.trae/
+__pycache__/
