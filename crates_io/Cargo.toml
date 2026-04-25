@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
 sea-orm = { version = "1", features = [
     "macros",
     "runtime-tokio-rustls",
@@ -15,3 +17,6 @@ sea-orm-migration = { version = "1", features = [
     "sqlx-postgres",
 ] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
