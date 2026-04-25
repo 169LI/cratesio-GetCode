@@ -1,10 +1,33 @@
+//! 功能
+//! -
+//! 这是 `datahandle-migration` 的入口程序，用于执行 SeaORM 的数据库迁移，并在需要时自动生成/更新
+//! `datahandle/src/entities` 下的实体代码。
+//!
+//! 环境变量加载
+//! -
+//! 程序优先读取工作区根目录的 `.env`（`../../.env`），失败时回退到当前目录的默认 `.env` 解析逻辑。
+//! 需要至少包含 `DATABASE_URL`（Postgres 连接串），用于执行迁移与生成实体。
+//!
+//! 运行方式
+//! -
+//! 在 `datahandle/migration` 目录执行：
+//! - 执行迁移：`cargo run -- up`
+//! - 查看状态：`cargo run -- status`
+//! - 回滚一步：`cargo run -- down`
+//! - 只生成实体：`cargo run -- update`
+//!
+//! 自动生成实体的触发条件
+//! -
+//! 当命令参数包含 `up` / `refresh` / `fresh` 时，迁移执行完成后会调用 `sea-orm-cli generate entity`
+//! 重新生成 `datahandle/src/entities` 下的实体代码；`down` 不会自动生成实体（如需更新请手动运行 `update`）。
+
 use dotenvy::dotenv;
 use sea_orm_migration::prelude::*;
 use std::path::PathBuf;
 
 fn should_update_entities(args: &[String]) -> bool {
     args.iter()
-        .any(|arg| matches!(arg.as_str(), "up" | "refresh" | "fresh" ))
+        .any(|arg| matches!(arg.as_str(), "up" | "refresh" | "fresh"))
 }
 
 fn load_env() {
