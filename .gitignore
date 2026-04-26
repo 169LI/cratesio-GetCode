@@ -6,3 +6,5 @@ logs/
 __pycache__/
 /mkdir/
 /rssembid/
+data.txt
+crates.txt

@@ -7,7 +7,7 @@
 //! - 子命令只做“选择功能”的分发，不承载大量参数
 //! - 具体参数尽量通过 `.env` / 环境变量读取（由 `config` 模块负责 Fail Fast 校验）
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "crates_io")]
@@ -21,4 +21,10 @@ pub struct Cli {
 pub enum Commands {
     Download,
     Build,
+    DataBatch(DataBatchCli),
+}
+
+#[derive(Args)]
+pub struct DataBatchCli {
+    pub category: String,
 }

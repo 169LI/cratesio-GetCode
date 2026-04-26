@@ -15,6 +15,7 @@
 //! - 查看状态：`cargo run -- status`
 //! - 回滚一步：`cargo run -- down`
 //! - 只生成实体：`cargo run -- update`
+//! - 当前迁移状态（哪些 pending）`cargo run -- status`
 //!
 //! 自动生成实体的触发条件
 //! -
