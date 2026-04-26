@@ -11,6 +11,7 @@
 //! -
 //! - 批量下载：`cargo run -p crates_io -- download`
 //! - 批量构建：`cargo run -p crates_io -- build`
+//! - 数据预处理/导入（需要先进行前两次数据库迁移建表，见：/datahandle/migrations/src/main.rs）：`cargo run -p crates_io -- data-batch import-base` 
 //!
 //! 环境变量（.env / 环境变量读取）
 //! -
@@ -24,7 +25,7 @@ mod pgdatahandle;
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use commands::{build, download};
+use commands::{build, databatch, download};
 use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -38,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Download => download::download_run(&db, &download_dir).await?,
         Commands::Build => build::build_run(&db).await?,
+        Commands::DataBatch(args) => databatch::batch_run(&db, &args).await?,
     }
 
     Ok(())

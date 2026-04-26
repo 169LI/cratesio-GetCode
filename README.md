@@ -1,8 +1,10 @@
 （根目录下运行）使用：
 
-1、需要先迁移数据库（前两次）、设置好.env
+1、需要先迁移数据库、导入预处理数据
 
-python datahandle/data_import/import.py  ：导入数据
+数据库迁移：见datahandle/migrations/src/main.rs具体说明
+
+基础数据的导入： `cargo run -p crates_io -- data-batch import-base`
 
 2、需要设置好.env中必要的字段
 

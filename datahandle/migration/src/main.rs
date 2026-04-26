@@ -10,11 +10,13 @@
 //!
 //! 运行方式
 //! -
-//! 在 `datahandle/migration` 目录执行：
-//! - 执行迁移：`cargo run -- up`
+//! 在 `datahandle/migration` 目录下执行：
+//! - 执行未执行的迁移：`cargo run -- up`
+//! - 执行未执行的迁移（指定次数）：`cargo run -- up -n 1`（只执行 1 个迁移）
 //! - 查看状态：`cargo run -- status`
 //! - 回滚一步：`cargo run -- down`
 //! - 只生成实体：`cargo run -- update`
+//! - 当前迁移状态（哪些 pending）`cargo run -- status`
 //!
 //! 自动生成实体的触发条件
 //! -
