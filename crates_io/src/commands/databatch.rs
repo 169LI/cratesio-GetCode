@@ -354,14 +354,15 @@ fn parse_pubtime_rfc3339(raw: &str) -> Option<NaiveDateTime> {
 }
 
 fn crate_name_to_index_rel_path(crate_name: &str) -> PathBuf {
-    match crate_name.len() {
+    let crate_name = crate_name.to_ascii_lowercase();
+    let name = crate_name.as_str();
+
+    match name.len() {
         0 => PathBuf::new(),
-        1 => PathBuf::from("1").join(crate_name),
-        2 => PathBuf::from("2").join(crate_name),
-        3 => PathBuf::from("3").join(&crate_name[..1]).join(crate_name),
-        _ => PathBuf::from(&crate_name[..2])
-            .join(&crate_name[2..4])
-            .join(crate_name),
+        1 => PathBuf::from("1").join(name),
+        2 => PathBuf::from("2").join(name),
+        3 => PathBuf::from("3").join(&name[..1]).join(name),
+        _ => PathBuf::from(&name[..2]).join(&name[2..4]).join(name),
     }
 }
 
@@ -542,6 +543,16 @@ fn load_latest_versions(data_txt: &Path) -> anyhow::Result<HashMap<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crate_name_to_index_rel_path_is_lowercase() {
+        assert_eq!(
+            crate_name_to_index_rel_path("GRE_dictation")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            "gr/e_/gre_dictation"
+        );
+    }
 
     #[test]
     fn parse_index_version_line_extracts_minimal_fields() {
