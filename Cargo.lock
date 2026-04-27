@@ -575,6 +575,7 @@ dependencies = [
  "dotenvy",
  "sea-orm",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

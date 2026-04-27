@@ -15,11 +15,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use datahandle::entities::crates;
+use datahandle::entities::{crate_versions_index, crates};
 use sea_orm::ActiveValue::Set;
-use sea_orm::Condition;
 use sea_orm::DbErr;
-use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
@@ -37,6 +35,16 @@ pub struct CrateImportRow {
     pub updated_at: sea_orm::prelude::DateTime,
     pub version_new: String,
     pub download_failed: bool,
+    pub version_handled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CrateVersionIndexRow {
+    pub crate_id: i32,
+    pub version: String,
+    pub deps: sea_orm::prelude::Json,
+    pub features2: Option<sea_orm::prelude::Json>,
+    pub pubtime: Option<sea_orm::prelude::DateTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +89,17 @@ impl PgDataHandle {
             .await
     }
 
+    pub async fn get_all_unhandled_version_crates(
+        &self,
+    ) -> Result<Vec<crates::Model>, sea_orm::DbErr> {
+        crates::Entity::find()
+            .filter(crates::Column::VersionHandled.eq(false))
+            .filter(crates::Column::DownloadFailed.eq(false))
+            .filter(crates::Column::Name.ne(""))
+            .all(self.get_connection())
+            .await
+    }
+
     /// 标记 crate 下载成功
     pub async fn mark_crate_downloaded(&self, id: i32) -> Result<(), sea_orm::DbErr> {
         crates::Entity::update_many()
@@ -110,6 +129,18 @@ impl PgDataHandle {
         Ok(())
     }
 
+    pub async fn mark_crate_version_handled(&self, id: i32) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::VersionHandled,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_crates_import_rows(&self, rows: Vec<CrateImportRow>) -> Result<u64, DbErr> {
         let rows_len: u64 = rows.len().try_into().unwrap_or(u64::MAX);
         if rows_len == 0 {
@@ -126,6 +157,7 @@ impl PgDataHandle {
             updated_at: Set(r.updated_at),
             version_new: Set(r.version_new),
             download_failed: Set(r.download_failed),
+            version_handled: Set(r.version_handled),
         });
 
         let res = crates::Entity::insert_many(active_models)
@@ -150,18 +182,41 @@ impl PgDataHandle {
         Ok(rows_len)
     }
 
-    pub async fn mark_yanked_for_empty_crate_version(&self) -> Result<u64, DbErr> {
-        let condition = Condition::any()
-            .add(crates::Column::VersionNew.is_null())
-            .add(crates::Column::VersionNew.eq(""));
+    pub async fn upsert_crate_versions_index_rows(
+        &self,
+        rows: Vec<CrateVersionIndexRow>,
+    ) -> Result<u64, DbErr> {
+        let rows_len: u64 = rows.len().try_into().unwrap_or(u64::MAX);
+        if rows_len == 0 {
+            return Ok(0);
+        }
 
-        let res = crates::Entity::update_many()
-            .col_expr(crates::Column::Download, Expr::value(true))
-            .col_expr(crates::Column::VersionNew, Expr::value("yanked"))
-            .filter(condition)
+        let active_models = rows.into_iter().map(|r| crate_versions_index::ActiveModel {
+            crate_id: Set(r.crate_id),
+            version: Set(r.version),
+            deps: Set(r.deps),
+            features2: Set(r.features2),
+            pubtime: Set(r.pubtime),
+            ..Default::default()
+        });
+
+        let res = crate_versions_index::Entity::insert_many(active_models)
+            .on_conflict(
+                OnConflict::columns([
+                    crate_versions_index::Column::CrateId,
+                    crate_versions_index::Column::Version,
+                ])
+                .update_columns([
+                    crate_versions_index::Column::Deps,
+                    crate_versions_index::Column::Features2,
+                    crate_versions_index::Column::Pubtime,
+                ])
+                .to_owned(),
+            )
             .exec(self.get_connection())
             .await?;
 
-        Ok(res.rows_affected)
+        let _ = res;
+        Ok(rows_len)
     }
 }

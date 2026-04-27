@@ -11,7 +11,8 @@
 //! -
 //! - 批量下载：`cargo run -p crates_io -- download`
 //! - 批量构建：`cargo run -p crates_io -- build`
-//! - 数据预处理/导入（需要先进行前两次数据库迁移建表，见：/datahandle/migrations/src/main.rs）：`cargo run -p crates_io -- data-batch import-base` 
+//! - 数据预处理/导入（需要先进行前两次数据库迁移建表，见：/datahandle/migrations/src/main.rs、准备数据：crates.txt、data.txt）：`cargo run -p crates_io -- data-batch import-base`
+//! - 版本以及依赖的预处理（需要先进行前3、4次数据库迁移建表，见：/datahandle/migrations/src/main.rs、准备数据：cratesio_index\）：`cargo run -p crates_io -- data-batch handle-version`
 //!
 //! 环境变量（.env / 环境变量读取）
 //! -

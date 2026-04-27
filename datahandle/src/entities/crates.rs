@@ -23,6 +23,7 @@ pub struct Model {
     pub updated_at: DateTime,
     pub version_new: String,
     pub download_failed: bool,
+    pub version_handled: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -36,6 +37,7 @@ pub enum Column {
     UpdatedAt,
     VersionNew,
     DownloadFailed,
+    VersionHandled,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -51,7 +53,9 @@ impl PrimaryKeyTrait for PrimaryKey {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter)]
-pub enum Relation {}
+pub enum Relation {
+    CrateVersionsIndex,
+}
 
 impl ColumnTrait for Column {
     type EntityName = Entity;
@@ -66,13 +70,24 @@ impl ColumnTrait for Column {
             Self::UpdatedAt => ColumnType::DateTime.def(),
             Self::VersionNew => ColumnType::String(StringLen::None).def(),
             Self::DownloadFailed => ColumnType::Boolean.def(),
+            Self::VersionHandled => ColumnType::Boolean.def(),
         }
     }
 }
 
 impl RelationTrait for Relation {
     fn def(&self) -> RelationDef {
-        panic!("No RelationDef")
+        match self {
+            Self::CrateVersionsIndex => {
+                Entity::has_many(super::crate_versions_index::Entity).into()
+            }
+        }
+    }
+}
+
+impl Related<super::crate_versions_index::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CrateVersionsIndex.def()
     }
 }
 

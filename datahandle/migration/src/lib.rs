@@ -1,8 +1,9 @@
-
 pub use sea_orm_migration::prelude::*;
 
 mod m20260425_000001_create_crates_table;
 mod m20260425_000002_add_download_retry_fields;
+mod m20260426_000003_add_version_handled_to_crates;
+mod m20260426_000004_create_crate_versions_index_table;
 
 pub struct Migrator;
 
@@ -12,6 +13,8 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260425_000001_create_crates_table::Migration),
             Box::new(m20260425_000002_add_download_retry_fields::Migration),
+            Box::new(m20260426_000003_add_version_handled_to_crates::Migration),
+            Box::new(m20260426_000004_create_crate_versions_index_table::Migration),
         ]
     }
 }

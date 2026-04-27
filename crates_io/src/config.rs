@@ -102,5 +102,19 @@ mod tests {
             "DOWNLOAD_DIR must be an existing directory: {}",
             download_dir.display()
         );
+
+        let index_dir_raw = std::env::var("CRATESIO_INDEX_DIR").unwrap_or_else(|_| {
+            panic!(
+                "missing env: CRATESIO_INDEX_DIR (loaded from {})",
+                workspace_env.display()
+            )
+        });
+        let index_dir = PathBuf::from(index_dir_raw);
+
+        assert!(
+            index_dir.is_dir(),
+            "CRATESIO_INDEX_DIR must be an existing directory: {}",
+            index_dir.display()
+        );
     }
 }
