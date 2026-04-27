@@ -6,6 +6,8 @@
 
 基础数据的导入： `cargo run -p crates_io -- data-batch import-base`
 
+版本号、依赖关系的解析与导入(批量下载后可运行)：`cargo run -p crates_io -- data-batch handle-version`
+
 2、需要设置好.env中必要的字段
 
 批量下载：`cargo run -p crates_io -- download`
@@ -16,9 +18,3 @@
 
 运行 crates_io 包的全部测试：
 `cargo test -p crates_io`
-
-1、测试 `.env` 中 `DOWNLOAD_DIR` 路径是否存在：
-`cargo test -p crates_io env_download_dir_exists -- --nocapture`
-
-2、测试下载目录分桶规则函数 (目录划分)：
-`cargo test -p crates_io test_get_crate_file_path`
