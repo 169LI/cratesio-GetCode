@@ -20,7 +20,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     Download,
-    Build,
+    Compile,
     DataBatch(DataBatchCli),
 }
 

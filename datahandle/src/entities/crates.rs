@@ -24,6 +24,10 @@ pub struct Model {
     pub version_new: String,
     pub download_failed: bool,
     pub version_handled: bool,
+    pub compile_handled: bool,
+    pub initial_compile_failed: bool,
+    pub cargo_lock_exists: i32,
+    pub dep_update_errors: Option<Json>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -38,6 +42,10 @@ pub enum Column {
     VersionNew,
     DownloadFailed,
     VersionHandled,
+    CompileHandled,
+    InitialCompileFailed,
+    CargoLockExists,
+    DepUpdateErrors,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -71,6 +79,10 @@ impl ColumnTrait for Column {
             Self::VersionNew => ColumnType::String(StringLen::None).def(),
             Self::DownloadFailed => ColumnType::Boolean.def(),
             Self::VersionHandled => ColumnType::Boolean.def(),
+            Self::CompileHandled => ColumnType::Boolean.def(),
+            Self::InitialCompileFailed => ColumnType::Boolean.def(),
+            Self::CargoLockExists => ColumnType::Integer.def(),
+            Self::DepUpdateErrors => ColumnType::JsonBinary.def().null(),
         }
     }
 }

@@ -446,6 +446,7 @@ dependencies = [
  "reqwest",
  "sea-orm",
  "sea-orm-migration",
+ "semver",
  "serde_json",
  "tar",
  "tokio",

@@ -102,14 +102,13 @@ impl PgDataHandle {
             .await
     }
 
-    /// 获取尚未处理版本索引数据的 crate 列表（一次性取全量）。
+    /// 获取尚未处理版本索引数据的 crate 列表（一次性取全量）
     ///
     /// 用于版本索引导入任务：
     /// - 仅挑选 version_handled=false（还没被“尝试处理过”）
     /// - 且 download_failed=false（避免对下载失败的 crate 做后续处理）
     /// - 且 name 非空
     ///
-    /// 注意：这是全量查询，数据量大时会占用较多内存。
     pub async fn get_all_unhandled_version_crates(
         &self,
     ) -> Result<Vec<crates::Model>, sea_orm::DbErr> {
@@ -119,6 +118,140 @@ impl PgDataHandle {
             .filter(crates::Column::Name.ne(""))
             .all(self.get_connection())
             .await
+    }
+
+    /// 获取尚未进行编译验证的 crate 列表,用于"编译任务"
+    ///
+    /// 用于编译任务：
+    /// - 仅挑选 download=true（已下载）
+    /// - 且 compile_handled=false（还没被“尝试编译””）
+    /// - 且 version_handled=true（已处理依赖版本信息）
+    pub async fn get_uncompiled_crates(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<crates::Model>, sea_orm::DbErr> {
+        crates::Entity::find()
+            .filter(crates::Column::Download.eq(true))
+            .filter(crates::Column::CompileHandled.eq(false))
+            .filter(crates::Column::VersionHandled.eq(true))
+            .limit(limit)
+            .all(self.get_connection())
+            .await
+    }
+
+    /// 获取特定 crate 最新版本的依赖列表，用于"编译任务"
+    ///
+    /// 参数：
+    /// - crate_id: 要查询的 crate 的 ID
+    /// - latest_version: 要查询的 crate 的最新版本
+    pub async fn get_crate_latest_dependencies(
+        &self,
+        crate_id: i32,
+        latest_version: &str,
+    ) -> Result<Option<crate_versions_index::Model>, sea_orm::DbErr> {
+        crate_versions_index::Entity::find()
+            .filter(crate_versions_index::Column::CrateId.eq(crate_id))
+            .filter(crate_versions_index::Column::Version.eq(latest_version))
+            .one(self.get_connection())
+            .await
+    }
+
+    pub async fn get_available_versions_from_db(
+        &self,
+        crate_name: &str,
+    ) -> Result<Option<Vec<String>>, sea_orm::DbErr> {
+        let crate_model = crates::Entity::find()
+            .filter(crates::Column::Name.eq(crate_name))
+            .one(self.get_connection())
+            .await?;
+        let Some(crate_model) = crate_model else {
+            return Ok(None);
+        };
+
+        let versions: Vec<String> = crate_versions_index::Entity::find()
+            .select_only()
+            .column(crate_versions_index::Column::Version)
+            .filter(crate_versions_index::Column::CrateId.eq(crate_model.id))
+            .into_tuple()
+            .all(self.get_connection())
+            .await?;
+
+        if versions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(versions))
+        }
+    }
+
+    /// 标记 crate 初始编译失败
+    pub async fn mark_initial_compile_failed(&self, id: i32) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::CompileHandled,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .col_expr(
+                crates::Column::InitialCompileFailed,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    /// 标记 crate 编译成功
+    pub async fn mark_crate_compile_handled(&self, id: i32) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::CompileHandled,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    /// 记录 crate 是否存在 Cargo.lock 文件
+    pub async fn record_cargo_lock_exists(
+        &self,
+        id: i32,
+        cargo_lock_exists: i32,
+    ) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::CargoLockExists,
+                sea_orm::sea_query::Expr::value(cargo_lock_exists),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
+    /// 记录 crate 的依赖更新编译结果
+    pub async fn record_compile_result(
+        &self,
+        id: i32,
+        errors_json: Option<sea_orm::prelude::Json>,
+    ) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::CompileHandled,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .col_expr(
+                crates::Column::DepUpdateErrors,
+                match errors_json {
+                    Some(json) => sea_orm::sea_query::Expr::value(json),
+                    None => sea_orm::sea_query::Expr::value(sea_orm::Value::Json(None)),
+                },
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
     }
 
     /// 标记 crate 下载成功
@@ -203,6 +336,7 @@ impl PgDataHandle {
             version_new: Set(r.version_new),
             download_failed: Set(r.download_failed),
             version_handled: Set(r.version_handled),
+            ..Default::default()
         });
 
         let res = crates::Entity::insert_many(active_models)

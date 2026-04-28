@@ -13,6 +13,7 @@
 //! - 批量构建：`cargo run -p crates_io -- build`
 //! - 数据预处理/导入（需要先进行前两次数据库迁移建表，见：/datahandle/migrations/src/main.rs、准备数据：crates.txt、data.txt）：`cargo run -p crates_io -- data-batch import-base`
 //! - 版本以及依赖的预处理（需要先进行前3、4次数据库迁移建表，见：/datahandle/migrations/src/main.rs、准备数据：cratesio_index\）：`cargo run -p crates_io -- data-batch handle-version`
+//! - 编译 crate（需要确保数据库迁移建表，见：/datahandle/migrations/src/main.rs）：`cargo run -p crates_io -- compile`
 //!
 //! 环境变量（.env / 环境变量读取）
 //! -
@@ -26,7 +27,7 @@ mod pgdatahandle;
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use commands::{build, databatch, download};
+use commands::{compile, databatch, download};
 use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Download => download::download_run(&db, &download_dir).await?,
-        Commands::Build => build::build_run(&db).await?,
+        Commands::Compile => compile::compile_run(&db).await?,
         Commands::DataBatch(args) => databatch::batch_run(&db, &args).await?,
     }
 

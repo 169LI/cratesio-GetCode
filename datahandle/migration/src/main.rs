@@ -22,6 +22,33 @@
 //! -
 //! 当命令参数包含 `up` / `refresh` / `fresh` 时，迁移执行完成后会调用 `sea-orm-cli generate entity`
 //! 重新生成 `datahandle/src/entities` 下的实体代码；`down` 不会自动生成实体（如需更新请手动运行 `update`）。
+//!
+//!
+//! 现有数据表对应字段的说明
+//! ## crates
+//!  Id: 主键，自增
+//!  Name: crate 名称
+//!  Homepage: crate 官方首页
+//!  Analyzed: 是否已分析   (默认 false)
+//!  Download: 是否已下载   (默认 false)
+//!  CreatedAt: 创建时间
+//!  UpdatedAt: 更新时间
+//!  VersionNew: 最新版本(稳定发布且符合语义化版本控制)
+//!  DownloadFailed: 是否下载失败   (默认 false)
+//!  VersionHandled: 是否已处理依赖版本信息的提取   (默认 false)
+//!  CompileHandled: 是否进入过“编译”流程   (默认 false)
+//!  InitialCompileFailed: 是否初始编译失败   (默认 false)
+//!  CargoLockExists: 源码目录中是否存在 Cargo.lock（记录编译前的状态）
+//!  DepUpdateErrors: 依赖更新失败错误信息
+//!
+//! ## crate_versions_index
+//!  Id: 主键，自增
+//!  CrateId: crate 主键
+//!  Version: 版本号
+//!  Deps: 依赖信息(JSON 格式)
+//!  Features2: 功能信息(JSON 格式)
+//!  Pubtime: 发布时间
+//!
 
 use dotenvy::dotenv;
 use sea_orm_migration::prelude::*;
