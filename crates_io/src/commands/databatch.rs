@@ -17,6 +17,9 @@ use crate::config::{self, ConfigLoad};
 use crate::pgdatahandle::{CrateImportRow, CrateVersionIndexRow, PgDataHandle};
 use anyhow::Context;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use datahandle::entities::crates;
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +33,7 @@ const VERSION_HANDLE_GROUP_SIZE: usize = 1000;
 const HANDLE_VERSION_CONCURRENCY: usize = 16;
 const HANDLE_VERSION_MAX_RETRIES: u32 = 3;
 const HANDLE_VERSION_TIMEOUT_SECS: u64 = 120;
+const PRECOMPILE_SKIP_NO_DEPS_BATCH_SIZE: u64 = 5000;
 
 #[derive(Debug, Clone)]
 pub struct ParsedCrateVersionRow {
@@ -46,10 +50,75 @@ pub async fn batch_run(db: &PgDataHandle, cli: &DataBatchCli) -> anyhow::Result<
     match cli.category.as_str() {
         "import-base" => import_base(db).await?,
         "handle-version" => handle_version(db).await?,
+        "precompile-skip-no-deps" => precompile_skip_no_deps(db).await?,
         other => {
             tracing::warn!(category = %other, "unknown DataBatch category");
         }
     }
+    Ok(())
+}
+
+async fn precompile_skip_no_deps(db: &PgDataHandle) -> anyhow::Result<()> {
+    tracing::info!(
+        stage = "precompile_skip_no_deps_start",
+        "compile preprocess stage"
+    );
+
+    loop {
+        let backend = db.get_connection().get_database_backend();
+        let sql = format!(
+            r#"
+SELECT c.id, c.name, c.version_new
+FROM crates c
+LEFT JOIN crate_versions_index i
+  ON i.crate_id = c.id AND i.version = c.version_new
+WHERE c.download = true
+  AND c.compile_handled = false
+  AND c.version_handled = true
+  AND i.id IS NOT NULL
+  AND jsonb_array_length(i.deps) = 0
+LIMIT {}
+"#,
+            PRECOMPILE_SKIP_NO_DEPS_BATCH_SIZE
+        );
+
+        let rows = db
+            .get_connection()
+            .query_all(Statement::from_string(backend, sql))
+            .await
+            .context("failed to query precompile skip-no-deps candidates")?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i32 = row.try_get("", "id")?;
+            ids.push(id);
+        }
+
+        let updated = crates::Entity::update_many()
+            .col_expr(crates::Column::CompileHandled, Expr::value(true))
+            .filter(crates::Column::Id.is_in(ids.clone()))
+            .exec(db.get_connection())
+            .await
+            .context("failed to mark compile_handled for skip-no-deps candidates")?
+            .rows_affected;
+
+        tracing::info!(
+            batch_size = PRECOMPILE_SKIP_NO_DEPS_BATCH_SIZE,
+            candidates = ids.len(),
+            updated,
+            stage = "precompile_skip_no_deps_batch_done",
+            "compile preprocess stage"
+        );
+    }
+
+    tracing::info!(
+        stage = "precompile_skip_no_deps_done",
+        "compile preprocess stage"
+    );
     Ok(())
 }
 

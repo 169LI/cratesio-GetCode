@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-const COMPILE_BATCH_SIZE: u64 = 2000; //每次从数据库拉取未编译的 crate 数量
-const COMPILE_GROUP_SIZE: usize = 400; // 每次取COMPILE_GROUP_SIZE作为一个并发组
+const COMPILE_BATCH_SIZE: u64 = 500; //每次从数据库拉取未编译的 crate 数量
+const COMPILE_GROUP_SIZE: usize = 100; // 每次取COMPILE_GROUP_SIZE作为一个并发组
 const COMPILE_CONCURRENCY: usize = 20; // 并发数不宜过高
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +112,7 @@ async fn acquire_cargo_cmd_permit<'a>(
 /// 并使用隔离的 CARGO_HOME 避免污染全局缓存。
 pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     // 提前确保所需的 toolchain 已经安装，防止并发编译时触发 rustup 导致冲突
-    ensure_rust_toolchain("1.95.0").await?;
+    // ensure_rust_toolchain("1.95.0").await?;
 
     let download_dir =
         config::get_config_once(&config::ConfigLoad::new())?.require("DOWNLOAD_DIR")?;
