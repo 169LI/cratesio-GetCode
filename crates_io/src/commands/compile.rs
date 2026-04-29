@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
-const COMPILE_BATCH_SIZE: u64 = 1000; //每次从数据库拉取未编译的 crate 数量
-const COMPILE_GROUP_SIZE: usize = 1; // 每次取COMPILE_GROUP_SIZE作为一个并发组
-const COMPILE_CONCURRENCY: usize = 1; // 编译非常吃 CPU，并发数不宜过高
+const COMPILE_BATCH_SIZE: u64 = 2000; //每次从数据库拉取未编译的 crate 数量
+const COMPILE_GROUP_SIZE: usize = 400; // 每次取COMPILE_GROUP_SIZE作为一个并发组
+const COMPILE_CONCURRENCY: usize = 20; // 并发数不宜过高
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepType {
@@ -43,7 +44,7 @@ struct IndexDepsByKind {
 /// 确保指定的 rust toolchain 已安装，避免并发时多个进程同时触发 rustup 导致报错
 #[allow(unused)]
 async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
-    // 1. 先检查是否已安装
+    tracing::info!(toolchain = %toolchain, stage = "toolchain_check", "checking rust toolchain");
     let list_output = Command::new("rustup")
         .args(["toolchain", "list"])
         .output()
@@ -51,16 +52,14 @@ async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
 
     if list_output.status.success() {
         let stdout = String::from_utf8_lossy(&list_output.stdout);
-        // rustup toolchain list 输出格式通常为: "1.95.0-x86_64-pc-windows-msvc (default)"
+        // rustup toolchain list 输出格式通常为: "1.95.0-----"
         if stdout.lines().any(|line| line.starts_with(toolchain)) {
-            tracing::info!("Rust toolchain {} is already installed.", toolchain);
+            tracing::info!(toolchain = %toolchain, stage = "toolchain_ready", "rust toolchain already installed");
             return Ok(());
         }
     }
 
-    tracing::info!("Ensuring rust toolchain {} is installed...", toolchain);
-
-    // 2. 如果没安装，再执行安装
+    tracing::info!(toolchain = %toolchain, stage = "toolchain_install", "installing rust toolchain");
     let status = Command::new("rustup")
         .args(["toolchain", "install", toolchain])
         .status()
@@ -73,8 +72,38 @@ async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
         ));
     }
 
-    tracing::info!("Rust toolchain {} is ready.", toolchain);
+    tracing::info!(toolchain = %toolchain, stage = "toolchain_ready", "rust toolchain installed");
     Ok(())
+}
+
+async fn acquire_cargo_cmd_permit<'a>(
+    cargo_cmd_semaphore: &'a Semaphore,
+    crate_id: i32,
+    crate_name: &str,
+    stage: &'static str,
+) -> anyhow::Result<SemaphorePermit<'a>> {
+    match cargo_cmd_semaphore.try_acquire() {
+        Ok(p) => Ok(p),
+        Err(_) => {
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                stage,
+                "waiting for cargo command lock"
+            );
+            let p = cargo_cmd_semaphore
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("failed to acquire cargo command permit"))?;
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                stage,
+                "cargo command lock acquired"
+            );
+            Ok(p)
+        }
+    }
 }
 
 /// 并发编译框架入口
@@ -83,7 +112,7 @@ async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
 /// 并使用隔离的 CARGO_HOME 避免污染全局缓存。
 pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     // 提前确保所需的 toolchain 已经安装，防止并发编译时触发 rustup 导致冲突
-    // ensure_rust_toolchain("1.95.0-x86_64-pc-windows-msvc").await?;
+    ensure_rust_toolchain("1.95.0").await?;
 
     let download_dir =
         config::get_config_once(&config::ConfigLoad::new())?.require("DOWNLOAD_DIR")?;
@@ -101,13 +130,16 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
 
     tracing::info!("start compile batch run");
 
-    let semaphore = Arc::new(Semaphore::new(COMPILE_CONCURRENCY));
-
     loop {
         let crates = db
             .get_uncompiled_crates(COMPILE_BATCH_SIZE)
             .await
             .context("failed to load uncompiled crates")?;
+        tracing::info!(
+            batch_size = COMPILE_BATCH_SIZE,
+            fetched = crates.len(),
+            "loaded uncompiled crates batch"
+        );
 
         if crates.is_empty() {
             break;
@@ -122,82 +154,128 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
                 "start handling compile group"
             );
 
-            let mut tasks = Vec::with_capacity(group.len());
+            let download_dir = download_dir.to_path_buf();
+            let group_items: Vec<(i32, String, String)> = group
+                .iter()
+                .map(|m| (m.id, m.name.clone(), m.version_new.clone()))
+                .collect();
+            let group_items = Arc::new(group_items);
+            let next_index = Arc::new(AtomicUsize::new(0));
 
-            for crate_model in group {
+            let mut worker_tasks = Vec::with_capacity(COMPILE_CONCURRENCY);
+            let mut worker_cargo_homes = Vec::with_capacity(COMPILE_CONCURRENCY);
+
+            for worker_id in 0..COMPILE_CONCURRENCY {
                 let db = db.clone();
-                let download_dir = download_dir.to_path_buf();
-                let cargo_home = experiment_cargo_home.clone();
-                let semaphore = semaphore.clone();
+                let download_dir = download_dir.clone();
+                let cargo_home = experiment_cargo_home.join(format!("worker_{:02}", worker_id));
+                if !cargo_home.exists() {
+                    fs::create_dir_all(&cargo_home).await?;
+                }
+                worker_cargo_homes.push(cargo_home.clone());
 
-                // 克隆所需数据用于 spawned task
-                let crate_id = crate_model.id;
-                let crate_name = crate_model.name.clone();
-                let version_new = crate_model.version_new.clone();
+                let group_items = group_items.clone();
+                let next_index = next_index.clone();
 
                 let task = tokio::spawn(async move {
-                    let _permit = match semaphore.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
+                    let cargo_cmd_semaphore = Semaphore::new(1);
+                    loop {
+                        let i = next_index.fetch_add(1, Ordering::Relaxed);
+                        if i >= group_items.len() {
+                            break;
+                        }
+                        let (crate_id, crate_name, version_new) = &group_items[i];
 
-                    let crate_dir = get_crate_file_path(&download_dir, &crate_name, &version_new)
-                        .with_extension("");
-                    let process_result = process_single_crate_compile(
-                        &db,
-                        &download_dir,
-                        &cargo_home,
-                        crate_id,
-                        &crate_name,
-                        &version_new,
-                    )
-                    .await;
-
-                    if let Err(err) = process_result {
-                        tracing::error!(
-                            crate_id,
+                        let crate_dir = get_crate_file_path(&download_dir, crate_name, version_new)
+                            .with_extension("");
+                        tracing::info!(
+                            crate_id = *crate_id,
                             crate_name = %crate_name,
-                            error = ?err,
-                            "failed to compile crate"
+                            version_new = %version_new,
+                            crate_dir = %crate_dir.display(),
+                            stage = "crate_start",
+                            "crate stage"
                         );
-                    }
 
-                    if crate_dir.exists() {
-                        if let Err(err) = cargo_clean(&crate_dir, &cargo_home).await {
-                            tracing::warn!(
-                                crate_id,
+                        let process_result = process_single_crate_compile(
+                            &db,
+                            &download_dir,
+                            &cargo_home,
+                            &cargo_cmd_semaphore,
+                            *crate_id,
+                            crate_name,
+                            version_new,
+                        )
+                        .await;
+
+                        if let Err(err) = process_result {
+                            tracing::error!(
+                                crate_id = *crate_id,
                                 crate_name = %crate_name,
                                 error = ?err,
-                                "failed to cargo clean crate dir"
+                                "failed to compile crate"
                             );
                         }
-                    }
 
-                    // 标记这个crate已经完成编译流程
-                    if let Err(err) = db.mark_crate_compile_handled(crate_id).await {
-                        tracing::error!(
-                            crate_id,
+                        if crate_dir.exists() {
+                            if let Err(err) = cargo_clean(
+                                *crate_id,
+                                crate_name,
+                                &crate_dir,
+                                &cargo_home,
+                                &cargo_cmd_semaphore,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    crate_id = *crate_id,
+                                    crate_name = %crate_name,
+                                    error = ?err,
+                                    "failed to cargo clean crate dir"
+                                );
+                            }
+                        }
+
+                        if let Err(err) = db.mark_crate_compile_handled(*crate_id).await {
+                            tracing::error!(
+                                crate_id = *crate_id,
+                                crate_name = %crate_name,
+                                error = ?err,
+                                "failed to mark crate as compile handled"
+                            );
+                        }
+                        tracing::info!(
+                            crate_id = *crate_id,
                             crate_name = %crate_name,
-                            error = ?err,
-                            "failed to mark crate as compile handled"
+                            version_new = %version_new,
+                            stage = "crate_done",
+                            "crate stage"
                         );
                     }
                 });
 
-                tasks.push(task);
+                worker_tasks.push(task);
             }
 
-            for task in tasks {
+            for task in worker_tasks {
                 if let Err(err) = task.await {
-                    tracing::error!(error = ?err, "compile task panicked");
+                    tracing::error!(error = ?err, "compile worker task panicked");
                 }
             }
 
             tracing::info!(
                 group_no,
-                "group finished, cleaning up isolated CARGO_HOME cache"
+                stage = "group_cleanup_start",
+                "compile group stage"
             );
-            cleanup_cargo_cache(&experiment_cargo_home).await;
+            for cargo_home in &worker_cargo_homes {
+                cleanup_cargo_cache(cargo_home).await;
+            }
+            tracing::info!(
+                group_no,
+                stage = "group_cleanup_done",
+                "compile group stage"
+            );
         }
     }
 
@@ -207,7 +285,22 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cargo_clean(crate_dir: &Path, cargo_home: &Path) -> anyhow::Result<()> {
+async fn cargo_clean(
+    crate_id: i32,
+    crate_name: &str,
+    crate_dir: &Path,
+    cargo_home: &Path,
+    cargo_cmd_semaphore: &Semaphore,
+) -> anyhow::Result<()> {
+    let _permit =
+        acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "cargo_clean").await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        crate_dir = %crate_dir.display(),
+        stage = "cargo_clean_start",
+        "crate stage"
+    );
     let status = Command::new("cargo")
         .args(["+1.95.0", "clean"])
         .current_dir(crate_dir)
@@ -216,7 +309,16 @@ async fn cargo_clean(crate_dir: &Path, cargo_home: &Path) -> anyhow::Result<()> 
         .stderr(Stdio::null())
         .status()?;
 
-    if status.success() {
+    let ok = status.success();
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        crate_dir = %crate_dir.display(),
+        ok,
+        stage = "cargo_clean_done",
+        "crate stage"
+    );
+    if ok {
         Ok(())
     } else {
         Err(anyhow::anyhow!("cargo clean failed"))
@@ -225,6 +327,11 @@ async fn cargo_clean(crate_dir: &Path, cargo_home: &Path) -> anyhow::Result<()> 
 
 /// 清理给定 CARGO_HOME 中的源码缓存，保留 index 索引以加速后续构建
 async fn cleanup_cargo_cache(cargo_home: &Path) {
+    tracing::info!(
+        cargo_home = %cargo_home.display(),
+        stage = "cargo_home_cleanup_start",
+        "compile stage"
+    );
     let registry_cache = cargo_home.join("registry").join("cache");
     let registry_src = cargo_home.join("registry").join("src");
     let git_checkouts = cargo_home.join("git").join("checkouts");
@@ -232,6 +339,11 @@ async fn cleanup_cargo_cache(cargo_home: &Path) {
     let _ = fs::remove_dir_all(&registry_cache).await;
     let _ = fs::remove_dir_all(&registry_src).await;
     let _ = fs::remove_dir_all(&git_checkouts).await;
+    tracing::info!(
+        cargo_home = %cargo_home.display(),
+        stage = "cargo_home_cleanup_done",
+        "compile stage"
+    );
 }
 
 /// 核心：单个 Crate 的编译验证与依赖更新
@@ -254,6 +366,7 @@ async fn process_single_crate_compile(
     db: &PgDataHandle,
     download_dir: &Path,
     cargo_home: &Path,
+    cargo_cmd_semaphore: &Semaphore,
     crate_id: i32,
     crate_name: &str,
     latest_version: &str,
@@ -269,12 +382,34 @@ async fn process_single_crate_compile(
         ));
     }
 
-    tracing::info!("开始验证 Crate: {}", crate_dir.display());
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        latest_version = %latest_version,
+        crate_dir = %crate_dir.display(),
+        stage = "crate_enter",
+        "crate stage"
+    );
 
     // 2. 从数据库查询该版本的依赖信息
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        latest_version = %latest_version,
+        stage = "deps_query_start",
+        "crate stage"
+    );
     let index_row = db
         .get_crate_latest_dependencies(crate_id, latest_version)
         .await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        latest_version = %latest_version,
+        found = index_row.is_some(),
+        stage = "deps_query_done",
+        "crate stage"
+    );
 
     let deps_json = match index_row {
         Some(row) => row.deps,
@@ -289,6 +424,15 @@ async fn process_single_crate_compile(
     };
 
     let deps_by_kind = collect_deps_by_kind_from_index_deps(&deps_json);
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        normal = deps_by_kind.normal.len(),
+        build = deps_by_kind.build.len(),
+        dev = deps_by_kind.dev.len(),
+        stage = "deps_parsed",
+        "crate stage"
+    );
 
     if deps_by_kind.normal.is_empty()
         && deps_by_kind.build.is_empty()
@@ -297,13 +441,35 @@ async fn process_single_crate_compile(
         tracing::info!(
             crate_id,
             crate_name = %crate_name,
+            stage = "skip_no_deps",
             "no dependencies found in index deps, skip baseline and update experiments"
         );
         return Ok(());
     }
 
-    let baseline_ok =
-        initial_compile_check(db, crate_id, &crate_dir, cargo_home, &deps_by_kind).await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        stage = "baseline_start",
+        "crate stage"
+    );
+    let baseline_ok = initial_compile_check(
+        db,
+        crate_id,
+        crate_name,
+        &crate_dir,
+        cargo_home,
+        cargo_cmd_semaphore,
+        &deps_by_kind,
+    )
+    .await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        baseline_ok,
+        stage = "baseline_done",
+        "crate stage"
+    );
 
     // 2. 初始编译验证 (Baseline)
     if !baseline_ok {
@@ -313,11 +479,44 @@ async fn process_single_crate_compile(
     }
 
     //3. 逐版本升级实验
-    let summary =
-        run_stepwise_upgrade_experiments(db, &crate_dir, cargo_home, &deps_by_kind).await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        stage = "upgrade_start",
+        "crate stage"
+    );
+    let summary = run_stepwise_upgrade_experiments(
+        db,
+        crate_id,
+        crate_name,
+        &crate_dir,
+        cargo_home,
+        cargo_cmd_semaphore,
+        &deps_by_kind,
+    )
+    .await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        has_errors = summary.errors_json.is_some(),
+        stage = "upgrade_done",
+        "crate stage"
+    );
 
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        stage = "db_write_result",
+        "crate stage"
+    );
     db.record_compile_result(crate_id, summary.errors_json)
         .await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        stage = "crate_done",
+        "crate stage"
+    );
 
     // // 4. 依赖更新验证
     // let mut success_count = 0;
@@ -384,8 +583,10 @@ fn collect_deps_by_kind_from_index_deps(deps_json: &serde_json::Value) -> IndexD
 async fn initial_compile_check(
     db: &PgDataHandle,
     crate_id: i32,
+    crate_name: &str,
     crate_dir: &Path,
     cargo_home: &Path,
+    cargo_cmd_semaphore: &Semaphore,
     deps_by_kind: &IndexDepsByKind,
 ) -> anyhow::Result<bool> {
     let cargo_toml = crate_dir.join("Cargo.toml");
@@ -394,17 +595,43 @@ async fn initial_compile_check(
     }
 
     let cargo_lock = crate_dir.join("Cargo.lock");
+    let cargo_lock_baseline = crate_dir.join("Cargo.lock.baseline");
+    let cargo_lock_baseline_exists = cargo_lock_baseline.exists();
     let cargo_lock_exists = if cargo_lock.exists() { 1 } else { 2 };
-    db.record_cargo_lock_exists(crate_id, cargo_lock_exists)
-        .await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        crate_dir = %crate_dir.display(),
+        cargo_lock_exists,
+        cargo_lock_baseline_exists,
+        stage = "cargo_lock_exists",
+        "crate stage"
+    );
+    if !cargo_lock_baseline_exists {
+        db.record_cargo_lock_exists(crate_id, cargo_lock_exists)
+            .await?;
+    } else {
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            crate_dir = %crate_dir.display(),
+            stage = "cargo_lock_exists_skip_db",
+            "crate stage"
+        );
+    }
 
     let need_build = !deps_by_kind.normal.is_empty() || !deps_by_kind.build.is_empty();
     let need_dev = !deps_by_kind.dev.is_empty();
     if !need_build && !need_dev {
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            crate_dir = %crate_dir.display(),
+            stage = "baseline_skip_no_build",
+            "crate stage"
+        );
         return Ok(true);
     }
-
-    let cargo_lock_baseline = crate_dir.join("Cargo.lock.baseline");
 
     if cargo_lock_baseline.exists() {
         let _ = fs::remove_file(&cargo_lock_baseline).await;
@@ -413,20 +640,60 @@ async fn initial_compile_check(
     if cargo_lock.exists() {
         fs::copy(&cargo_lock, &cargo_lock_baseline).await?;
 
+        let _permit =
+            acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "baseline_build")
+                .await?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            stage = "baseline_build_start",
+            "crate stage"
+        );
         let status = Command::new("cargo")
             .args(["+1.95.0", "build", "--locked"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
             .status()?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            crate_dir = %crate_dir.display(),
+            ok = status.success(),
+            stage = "baseline_build_done",
+            "crate stage"
+        );
         if !status.success() {
             return Ok(false);
         }
     } else {
+        let _permit = acquire_cargo_cmd_permit(
+            cargo_cmd_semaphore,
+            crate_id,
+            crate_name,
+            "baseline_build_init",
+        )
+        .await?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            stage = "baseline_build_start",
+            locked = false,
+            "crate stage"
+        );
         let init_status = Command::new("cargo")
             .args(["+1.95.0", "build"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
             .status()?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            crate_dir = %crate_dir.display(),
+            ok = init_status.success(),
+            cargo_lock_now_exists = cargo_lock.exists(),
+            stage = "baseline_build_done",
+            "crate stage"
+        );
         if !init_status.success() || !cargo_lock.exists() {
             return Ok(false);
         }
@@ -434,20 +701,51 @@ async fn initial_compile_check(
     }
 
     if need_dev {
+        let _permit =
+            acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "baseline_test")
+                .await?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            stage = "baseline_test_start",
+            "crate stage"
+        );
         let test_status = Command::new("cargo")
             .args(["+1.95.0", "test", "--no-run", "--locked"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
             .status()?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            crate_dir = %crate_dir.display(),
+            ok = test_status.success(),
+            stage = "baseline_test_done",
+            "crate stage"
+        );
         if !test_status.success() {
             return Ok(false);
         }
 
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            stage = "baseline_bench_start",
+            "crate stage"
+        );
         let bench_status = Command::new("cargo")
             .args(["+1.95.0", "bench", "--no-run", "--locked"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
             .status()?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            crate_dir = %crate_dir.display(),
+            ok = bench_status.success(),
+            stage = "baseline_bench_done",
+            "crate stage"
+        );
         if !bench_status.success() {
             return Ok(false);
         }
@@ -458,6 +756,13 @@ async fn initial_compile_check(
     }
     fs::copy(&cargo_toml, &cargo_toml_baseline).await?;
 
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        crate_dir = %crate_dir.display(),
+        stage = "baseline_completed",
+        "crate stage"
+    );
     Ok(true)
 }
 
@@ -469,8 +774,11 @@ struct UpgradeExperimentSummary {
 /// 逐依赖、逐版本执行 `cargo update --precise` 后再编译验证，只记录 update 成功但 verify 失败的 target_version。
 async fn run_stepwise_upgrade_experiments(
     db: &PgDataHandle,
+    crate_id: i32,
+    crate_name: &str,
     crate_dir: &Path,
     cargo_home: &Path,
+    cargo_cmd_semaphore: &Semaphore,
     deps_by_kind: &IndexDepsByKind,
 ) -> anyhow::Result<UpgradeExperimentSummary> {
     let deps = flatten_index_deps(deps_by_kind);
@@ -507,29 +815,65 @@ async fn run_stepwise_upgrade_experiments(
                 continue;
             }
         };
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            dep_name = %dep.name,
+            dep_type = %dep_type_to_str(&dep.dep_type),
+            req = %dep.req,
+            versions = versions.len(),
+            stage = "dep_versions_loaded",
+            "crate stage"
+        );
 
         for version in versions {
             restore_baseline_project_state(crate_dir).await?;
 
-            let update_ok = cargo_update_precise(crate_dir, cargo_home, &dep.name, &version)
-                .await
-                .with_context(|| {
-                    format!(
-                        "cargo update -p {} --precise {} failed to execute",
-                        dep.name, version
-                    )
-                })?;
+            let update_ok = cargo_update_precise(
+                crate_id,
+                crate_name,
+                crate_dir,
+                cargo_home,
+                cargo_cmd_semaphore,
+                &dep.name,
+                &version,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "cargo update -p {} --precise {} failed to execute",
+                    dep.name, version
+                )
+            })?;
 
             if !update_ok {
                 continue;
             }
 
-            let verify_ok = verify_after_update(crate_dir, cargo_home, &dep.dep_type).await?;
+            let verify_ok = verify_after_update(
+                crate_id,
+                crate_name,
+                crate_dir,
+                cargo_home,
+                cargo_cmd_semaphore,
+                &dep.dep_type,
+                &dep.name,
+                &version,
+            )
+            .await?;
 
             if verify_ok {
                 continue;
             }
 
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                dep_name = %dep.name,
+                target_version = %version,
+                stage = "verify_failed",
+                "crate stage"
+            );
             let dep_key = dep.name.clone();
             let entry = errors.entry(dep_key).or_insert_with(|| {
                 serde_json::json!({
@@ -618,11 +962,25 @@ async fn restore_baseline_project_state(crate_dir: &Path) -> anyhow::Result<()> 
 
 /// 执行 `cargo update -p <dep> --precise <target_version>`，返回更新是否成功
 async fn cargo_update_precise(
+    crate_id: i32,
+    crate_name: &str,
     crate_dir: &Path,
     cargo_home: &Path,
+    cargo_cmd_semaphore: &Semaphore,
     dep_name: &str,
     target_version: &str,
 ) -> anyhow::Result<bool> {
+    let _permit =
+        acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "cargo_update").await?;
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        crate_dir = %crate_dir.display(),
+        dep_name = %dep_name,
+        target_version = %target_version,
+        stage = "dep_update_start",
+        "crate stage"
+    );
     let status = Command::new("cargo")
         .args([
             "+1.95.0",
@@ -638,17 +996,45 @@ async fn cargo_update_precise(
         .stderr(Stdio::null())
         .status()?;
 
-    Ok(status.success())
+    let ok = status.success();
+    tracing::info!(
+        crate_id,
+        crate_name = %crate_name,
+        crate_dir = %crate_dir.display(),
+        dep_name = %dep_name,
+        target_version = %target_version,
+        ok,
+        stage = "dep_update_done",
+        "crate stage"
+    );
+    Ok(ok)
 }
 
 /// 更新依赖后执行编译验证：normal/build 跑 build，dev 跑 test+bench（均使用 --locked）
 async fn verify_after_update(
+    crate_id: i32,
+    crate_name: &str,
     crate_dir: &Path,
     cargo_home: &Path,
+    cargo_cmd_semaphore: &Semaphore,
     dep_type: &DepType,
+    dep_name: &str,
+    target_version: &str,
 ) -> anyhow::Result<bool> {
     match dep_type {
         DepType::Normal | DepType::Build => {
+            let _permit =
+                acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "verify_build")
+                    .await?;
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                crate_dir = %crate_dir.display(),
+                dep_name = %dep_name,
+                target_version = %target_version,
+                stage = "verify_build_start",
+                "crate stage"
+            );
             let status = Command::new("cargo")
                 .args(["+1.95.0", "build", "--locked"])
                 .current_dir(crate_dir)
@@ -656,9 +1042,32 @@ async fn verify_after_update(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()?;
-            Ok(status.success())
+            let ok = status.success();
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                crate_dir = %crate_dir.display(),
+                dep_name = %dep_name,
+                target_version = %target_version,
+                ok,
+                stage = "verify_build_done",
+                "crate stage"
+            );
+            Ok(ok)
         }
         DepType::Dev => {
+            let _permit =
+                acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "verify_dev")
+                    .await?;
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                crate_dir = %crate_dir.display(),
+                dep_name = %dep_name,
+                target_version = %target_version,
+                stage = "verify_test_start",
+                "crate stage"
+            );
             let test_status = Command::new("cargo")
                 .args(["+1.95.0", "test", "--no-run", "--locked"])
                 .current_dir(crate_dir)
@@ -667,10 +1076,30 @@ async fn verify_after_update(
                 .stderr(Stdio::null())
                 .status()?;
 
-            if !test_status.success() {
+            let test_ok = test_status.success();
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                crate_dir = %crate_dir.display(),
+                dep_name = %dep_name,
+                target_version = %target_version,
+                ok = test_ok,
+                stage = "verify_test_done",
+                "crate stage"
+            );
+            if !test_ok {
                 return Ok(false);
             }
 
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                crate_dir = %crate_dir.display(),
+                dep_name = %dep_name,
+                target_version = %target_version,
+                stage = "verify_bench_start",
+                "crate stage"
+            );
             let bench_status = Command::new("cargo")
                 .args(["+1.95.0", "bench", "--no-run", "--locked"])
                 .current_dir(crate_dir)
@@ -679,7 +1108,18 @@ async fn verify_after_update(
                 .stderr(Stdio::null())
                 .status()?;
 
-            Ok(bench_status.success())
+            let ok = bench_status.success();
+            tracing::info!(
+                crate_id,
+                crate_name = %crate_name,
+                crate_dir = %crate_dir.display(),
+                dep_name = %dep_name,
+                target_version = %target_version,
+                ok,
+                stage = "verify_bench_done",
+                "crate stage"
+            );
+            Ok(ok)
         }
     }
 }
