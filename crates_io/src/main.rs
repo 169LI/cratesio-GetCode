@@ -19,7 +19,7 @@
 //! 
 //! 1. 导入基础数据:cargo run -- up (后续每次更新代码时都要先进行数据库迁移、以及.env变量的调整和相对文件的下载)
 //! 2. 下载文件：cargo run -p crates_io -- download   (不要全部下载，下载一分钟的文件量就可以，全部下载需要20多G)
-//! 3. 处理依赖版本信息:cargo run -p crates_io -- data-batch version-handled
+//! 3. 处理依赖版本信息:cargo run -p crates_io -- data-batch handle-version
 //! 4. 预处理编译状态（compile_handled）:cargo run -p crates_io -- data-batch precompile-skip-no-deps
 //! 5. 处理依赖更新失败错误信息（dep_update_errors）：cargo run -p crates_io -- compile
 //! 
