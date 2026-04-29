@@ -309,6 +309,10 @@ fn parse_index_version_line(line: &str) -> anyhow::Result<Option<ParsedCrateVers
         _ => return Ok(None),
     };
 
+    if value.get("yanked").and_then(Value::as_bool) == Some(true) {
+        return Ok(None);
+    }
+
     let deps = extract_minimal_deps_json(value.get("deps"));
     let features2 = value.get("features2").cloned();
     let pubtime = value
@@ -581,5 +585,24 @@ mod tests {
         let line = r#"{"name":"a","deps":[]}"#;
         let parsed = parse_index_version_line(line).unwrap();
         assert!(parsed.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_crate_versions_from_file_skips_yanked_lines() {
+        let lines = [
+            r#"{"name":"a","vers":"0.1.0","deps":[],"yanked":true,"v":2}"#,
+            r#"{"name":"a","vers":"0.2.0","deps":[],"yanked":false,"v":2}"#,
+            r#"{"name":"a","vers":"0.3.0","deps":[],"yanked":true,"v":2}"#,
+        ]
+        .join("\n");
+        let file_path =
+            std::env::temp_dir().join(format!("crates_io_index_test_{}.json", std::process::id()));
+        std::fs::write(&file_path, lines).unwrap();
+
+        let parsed = parse_crate_versions_from_file(&file_path).await.unwrap();
+        let _ = std::fs::remove_file(&file_path);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].version, "0.2.0");
     }
 }
