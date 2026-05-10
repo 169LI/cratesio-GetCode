@@ -200,7 +200,7 @@ impl PgDataHandle {
         Ok(())
     }
 
-    /// 标记 crate 编译成功
+    /// 标记 crate 编译阶段实验完成
     pub async fn mark_crate_compile_handled(&self, id: i32) -> Result<(), sea_orm::DbErr> {
         crates::Entity::update_many()
             .col_expr(

@@ -12,12 +12,17 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use tokio::fs;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-const COMPILE_BATCH_SIZE: u64 = 500; //每次从数据库拉取未编译的 crate 数量
-const COMPILE_GROUP_SIZE: usize = 100; // 每次取COMPILE_GROUP_SIZE作为一个并发组
-const COMPILE_CONCURRENCY: usize = 20; // 并发数不宜过高
+const COMPILE_BATCH_SIZE: u64 = 2000; //每次从数据库拉取未编译的 crate 数量
+const COMPILE_GROUP_SIZE: usize = 200; // 每次取COMPILE_GROUP_SIZE作为一个并发组
+
+// 注意：后续在其他服务器上跑时，可通过修改以下两个常量或引入环境变量来调整：
+// 推荐公式：COMPILE_CONCURRENCY * CARGO_BUILD_JOBS ≈ CPU逻辑核数 (或略大)
+const COMPILE_CONCURRENCY: usize = 10; // 建议值：你的 24 线程(i7-14650HX)机器上，配合 JOBS=3，设为 12 比较稳
+const CARGO_BUILD_JOBS: &str = "6"; // 控制每个 cargo build 的内部并发数
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepType {
@@ -110,6 +115,11 @@ async fn acquire_cargo_cmd_permit<'a>(
 ///
 /// 从数据库批量拉取待编译的 crate，按组并发执行单 crate 的编译与依赖升级实验，
 /// 并使用隔离的 CARGO_HOME 避免污染全局缓存。
+/// 
+/// 并发逻辑怎么跑的
+/// 外层无限循环 ：每次从 DB 拉一批待编译 crate（ COMPILE_BATCH_SIZE ），再把这批按 COMPILE_GROUP_SIZE 切成若干组，组与组之间是串行处理的（一个组完全跑完才进入下一个组）。
+/// 每个 group 启动固定数量的 worker ： for worker_id in 0..COMPILE_CONCURRENCY 会 spawn 出 COMPILE_CONCURRENCY 个 tokio 任务（worker）。
+/// 动态领活（不平均分配） ：所有 worker 共享一个 next_index: AtomicUsize 。每个 worker 在 loop 里 fetch_add(1) 拿到一个唯一的 i，然后处理 group_items[i] 对应的 crate。谁先跑完谁继续领下一个，直到 i 超过 group_items.len() 才退出。
 pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     // 提前确保所需的 toolchain 已经安装，防止并发编译时触发 rustup 导致冲突
     // ensure_rust_toolchain("1.95.0").await?;
@@ -145,9 +155,10 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
             break;
         }
 
+        let total_start = Instant::now();
         for (group_no, group) in crates.chunks(COMPILE_GROUP_SIZE).enumerate() {
             let group_no: u64 = (group_no + 1).try_into().unwrap_or(u64::MAX);
-            tracing::info!(
+            tracing::warn!(
                 group_no,
                 group_size = group.len(),
                 concurrency = COMPILE_CONCURRENCY,
@@ -199,7 +210,7 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
 
                         let process_result = process_single_crate_compile(
                             &db,
-                            &download_dir,
+                            &crate_dir,
                             &cargo_home,
                             &cargo_cmd_semaphore,
                             *crate_id,
@@ -271,8 +282,9 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
             for cargo_home in &worker_cargo_homes {
                 cleanup_cargo_cache(cargo_home).await;
             }
-            tracing::info!(
+            tracing::error!(
                 group_no,
+                elapsed_ms = total_start.elapsed().as_millis(),
                 stage = "group_cleanup_done",
                 "compile group stage"
             );
@@ -305,6 +317,7 @@ async fn cargo_clean(
         .args(["+1.95.0", "clean"])
         .current_dir(crate_dir)
         .env("CARGO_HOME", cargo_home)
+        .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
@@ -356,7 +369,7 @@ async fn cleanup_cargo_cache(cargo_home: &Path) {
 ///
 /// 参数：
 /// - db: 数据库句柄，用于查询和更新 crate 数据
-/// - download_dir: 下载目录路径，用于查找 crate 目录
+/// - crate_dir: crate 解压后的源码目录路径
 /// - cargo_home: 独立使用的 CARGO_HOME 目录，避免污染全局
 /// - crate_id: 要编译的 crate 的 ID
 /// - crate_name: 要编译的 crate 的名称
@@ -364,17 +377,13 @@ async fn cleanup_cargo_cache(cargo_home: &Path) {
 ///
 async fn process_single_crate_compile(
     db: &PgDataHandle,
-    download_dir: &Path,
+    crate_dir: &Path,
     cargo_home: &Path,
     cargo_cmd_semaphore: &Semaphore,
     crate_id: i32,
     crate_name: &str,
     latest_version: &str,
 ) -> anyhow::Result<()> {
-    // 1. 查找下载目录中的对应版本目录
-    let crate_archive_path = get_crate_file_path(download_dir, crate_name, latest_version);
-    let crate_dir = crate_archive_path.with_extension("");
-
     if !crate_dir.exists() || !crate_dir.is_dir() {
         return Err(anyhow::anyhow!(
             "Crate directory not found: {}",
@@ -478,7 +487,7 @@ async fn process_single_crate_compile(
         return Ok(());
     }
 
-    //3. 逐版本升级实验
+    //3. 逐版本升级实验  调整为：每个依赖只测当前项目下允许更新到的最新的一个版本
     tracing::info!(
         crate_id,
         crate_name = %crate_name,
@@ -517,24 +526,6 @@ async fn process_single_crate_compile(
         stage = "crate_done",
         "crate stage"
     );
-
-    // // 4. 依赖更新验证
-    // let mut success_count = 0;
-    // let mut failed_count = 0;
-    // let mut update_errors = serde_json::Map::new();
-
-    // // 5. 记录最终结果到数据库
-    // db.record_compile_result(
-    //     crate_id,
-    //     success_count,
-    //     failed_count,
-    //     if update_errors.is_empty() {
-    //         None
-    //     } else {
-    //         Some(serde_json::Value::Object(update_errors))
-    //     },
-    // )
-    // .await?;
 
     Ok(())
 }
@@ -649,16 +640,19 @@ async fn initial_compile_check(
             stage = "baseline_build_start",
             "crate stage"
         );
+        let build_start = Instant::now();
         let status = Command::new("cargo")
             .args(["+1.95.0", "build", "--locked"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
+            .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
             .status()?;
         tracing::info!(
             crate_id,
             crate_name = %crate_name,
             crate_dir = %crate_dir.display(),
             ok = status.success(),
+            elapsed_ms = build_start.elapsed().as_millis(),
             stage = "baseline_build_done",
             "crate stage"
         );
@@ -680,10 +674,12 @@ async fn initial_compile_check(
             locked = false,
             "crate stage"
         );
+        let init_start = Instant::now();
         let init_status = Command::new("cargo")
             .args(["+1.95.0", "build"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
+            .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
             .status()?;
         tracing::info!(
             crate_id,
@@ -691,6 +687,7 @@ async fn initial_compile_check(
             crate_dir = %crate_dir.display(),
             ok = init_status.success(),
             cargo_lock_now_exists = cargo_lock.exists(),
+            elapsed_ms = init_start.elapsed().as_millis(),
             stage = "baseline_build_done",
             "crate stage"
         );
@@ -710,16 +707,19 @@ async fn initial_compile_check(
             stage = "baseline_test_start",
             "crate stage"
         );
+        let test_start = Instant::now();
         let test_status = Command::new("cargo")
             .args(["+1.95.0", "test", "--no-run", "--locked"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
+            .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
             .status()?;
         tracing::info!(
             crate_id,
             crate_name = %crate_name,
             crate_dir = %crate_dir.display(),
             ok = test_status.success(),
+            elapsed_ms = test_start.elapsed().as_millis(),
             stage = "baseline_test_done",
             "crate stage"
         );
@@ -733,16 +733,19 @@ async fn initial_compile_check(
             stage = "baseline_bench_start",
             "crate stage"
         );
+        let bench_start = Instant::now();
         let bench_status = Command::new("cargo")
             .args(["+1.95.0", "bench", "--no-run", "--locked"])
             .current_dir(crate_dir)
             .env("CARGO_HOME", cargo_home)
+            .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
             .status()?;
         tracing::info!(
             crate_id,
             crate_name = %crate_name,
             crate_dir = %crate_dir.display(),
             ok = bench_status.success(),
+            elapsed_ms = bench_start.elapsed().as_millis(),
             stage = "baseline_bench_done",
             "crate stage"
         );
@@ -804,7 +807,7 @@ async fn run_stepwise_upgrade_experiments(
             }
         };
 
-        let versions = match get_available_versions(db, &dep.name, &version_req).await {
+        let version = match get_available_versions(db, &dep.name, &version_req).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
@@ -821,75 +824,98 @@ async fn run_stepwise_upgrade_experiments(
             dep_name = %dep.name,
             dep_type = %dep_type_to_str(&dep.dep_type),
             req = %dep.req,
-            versions = versions.len(),
+            versions = if version.is_some() { 1 } else { 0 },
             stage = "dep_versions_loaded",
             "crate stage"
         );
 
-        for version in versions {
-            restore_baseline_project_state(crate_dir).await?;
+        let Some(version) = version else {
+            continue;
+        };
+        restore_baseline_project_state(crate_dir).await?;
 
-            let update_ok = cargo_update_precise(
-                crate_id,
-                crate_name,
-                crate_dir,
-                cargo_home,
-                cargo_cmd_semaphore,
-                &dep.name,
-                &version,
+        let update_start = Instant::now();
+        let update_ok = cargo_update_precise(
+            crate_id,
+            crate_name,
+            crate_dir,
+            cargo_home,
+            cargo_cmd_semaphore,
+            &dep.name,
+            &version,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "cargo update -p {} --precise {} failed to execute",
+                dep.name, version
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "cargo update -p {} --precise {} failed to execute",
-                    dep.name, version
-                )
-            })?;
+        })?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            dep_name = %dep.name,
+            target_version = %version,
+            update_ok,
+            elapsed_ms = update_start.elapsed().as_millis(),
+            stage = "dep_update_done",
+            "crate stage"
+        );
 
-            if !update_ok {
-                continue;
-            }
+        if !update_ok {
+            continue;
+        }
 
-            let verify_ok = verify_after_update(
-                crate_id,
-                crate_name,
-                crate_dir,
-                cargo_home,
-                cargo_cmd_semaphore,
-                &dep.dep_type,
-                &dep.name,
-                &version,
-            )
-            .await?;
+        let verify_start = Instant::now();
+        let verify_ok = verify_after_update(
+            crate_id,
+            crate_name,
+            crate_dir,
+            cargo_home,
+            cargo_cmd_semaphore,
+            &dep.dep_type,
+            &dep.name,
+            &version,
+        )
+        .await?;
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            dep_name = %dep.name,
+            target_version = %version,
+            verify_ok,
+            elapsed_ms = verify_start.elapsed().as_millis(),
+            stage = "verify_after_update_done",
+            "crate stage"
+        );
 
-            if verify_ok {
-                continue;
-            }
+        if verify_ok {
+            continue;
+        }
 
-            tracing::info!(
-                crate_id,
-                crate_name = %crate_name,
-                dep_name = %dep.name,
-                target_version = %version,
-                stage = "verify_failed",
-                "crate stage"
-            );
-            let dep_key = dep.name.clone();
-            let entry = errors.entry(dep_key).or_insert_with(|| {
-                serde_json::json!({
-                    "dep_type": dep_type_to_str(&dep.dep_type),
-                    "req": dep.req,
-                    "failed_targets": []
-                })
-            });
+        tracing::info!(
+            crate_id,
+            crate_name = %crate_name,
+            dep_name = %dep.name,
+            target_version = %version,
+            stage = "verify_failed",
+            "crate stage"
+        );
+        let dep_key = dep.name.clone();
+        let entry = errors.entry(dep_key).or_insert_with(|| {
+            serde_json::json!({
+                "dep_type": dep_type_to_str(&dep.dep_type),
+                "req": dep.req,
+                "failed_targets": []
+            })
+        });
 
-            if let Some(arr) = entry
-                .get_mut("failed_targets")
-                .and_then(|v| v.as_array_mut())
-            {
-                if !arr.iter().any(|v| v.as_str() == Some(&version)) {
-                    arr.push(serde_json::Value::String(version));
-                }
+        if let Some(arr) = entry
+            .get_mut("failed_targets")
+            .and_then(|v| v.as_array_mut())
+        {
+            if !arr.iter().any(|v| v.as_str() == Some(&version)) {
+                arr.push(serde_json::Value::String(version));
             }
         }
     }
@@ -992,6 +1018,7 @@ async fn cargo_update_precise(
         ])
         .current_dir(crate_dir)
         .env("CARGO_HOME", cargo_home)
+        .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
@@ -1035,10 +1062,12 @@ async fn verify_after_update(
                 stage = "verify_build_start",
                 "crate stage"
             );
+            let build_start = Instant::now();
             let status = Command::new("cargo")
                 .args(["+1.95.0", "build", "--locked"])
                 .current_dir(crate_dir)
                 .env("CARGO_HOME", cargo_home)
+                .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()?;
@@ -1050,6 +1079,7 @@ async fn verify_after_update(
                 dep_name = %dep_name,
                 target_version = %target_version,
                 ok,
+                elapsed_ms = build_start.elapsed().as_millis(),
                 stage = "verify_build_done",
                 "crate stage"
             );
@@ -1068,10 +1098,12 @@ async fn verify_after_update(
                 stage = "verify_test_start",
                 "crate stage"
             );
+            let test_start = Instant::now();
             let test_status = Command::new("cargo")
                 .args(["+1.95.0", "test", "--no-run", "--locked"])
                 .current_dir(crate_dir)
                 .env("CARGO_HOME", cargo_home)
+                .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()?;
@@ -1084,6 +1116,7 @@ async fn verify_after_update(
                 dep_name = %dep_name,
                 target_version = %target_version,
                 ok = test_ok,
+                elapsed_ms = test_start.elapsed().as_millis(),
                 stage = "verify_test_done",
                 "crate stage"
             );
@@ -1100,10 +1133,12 @@ async fn verify_after_update(
                 stage = "verify_bench_start",
                 "crate stage"
             );
+            let bench_start = Instant::now();
             let bench_status = Command::new("cargo")
                 .args(["+1.95.0", "bench", "--no-run", "--locked"])
                 .current_dir(crate_dir)
                 .env("CARGO_HOME", cargo_home)
+                .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()?;
@@ -1116,6 +1151,7 @@ async fn verify_after_update(
                 dep_name = %dep_name,
                 target_version = %target_version,
                 ok,
+                elapsed_ms = bench_start.elapsed().as_millis(),
                 stage = "verify_bench_done",
                 "crate stage"
             );
@@ -1138,7 +1174,7 @@ async fn get_available_versions(
     db: &PgDataHandle,
     crate_name: &str,
     req: &VersionReq,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Option<String>> {
     let versions = if let Some(versions) = db.get_available_versions_from_db(crate_name).await? {
         versions
     } else {
@@ -1149,11 +1185,15 @@ async fn get_available_versions(
 }
 
 /// 过滤版本列表：保留能解析为 semver 且满足给定 VersionReq 的版本。
-fn filter_versions_by_req(versions: Vec<String>, req: &VersionReq) -> Vec<String> {
-    versions
+/// 修改逻辑：按照 semver 解析后的大小进行降序排序，并且只保留符合条件的最新 1 个版本。
+fn filter_versions_by_req(versions: Vec<String>, req: &VersionReq) -> Option<String> {
+    let parsed_versions: Vec<Version> = versions
         .into_iter()
-        .filter(|v| Version::parse(v).is_ok_and(|ver| req.matches(&ver)))
-        .collect()
+        .filter_map(|v| Version::parse(&v).ok())
+        .filter(|ver| req.matches(ver))
+        .collect();
+
+    parsed_versions.into_iter().max().map(|v| v.to_string())
 }
 
 /// 通过 crates.io HTTP API 获取指定 crate 的所有非 yanked 版本号。
@@ -1161,7 +1201,7 @@ async fn get_available_versions_via_api(crate_name: &str) -> anyhow::Result<Vec<
     let url = format!("https://crates.io/api/v1/crates/{}", crate_name);
 
     let client = reqwest::Client::builder()
-        .user_agent("cratesio-GetCode-Bot (https://github.com/rust-lang)")
+        .user_agent("cratesio-GetCode-Bot ")
         .build()?;
 
     let resp = client.get(&url).send().await?;
@@ -1211,7 +1251,7 @@ mod tests {
 
         let req = VersionReq::parse("^1.0.51").unwrap();
         let filtered = filter_versions_by_req(versions, &req);
-        assert_eq!(filtered, vec!["1.5.0".to_string(), "1.0.51".to_string()]);
+        assert_eq!(filtered, Some("1.5.0".to_string()));
 
         let versions2 = vec![
             "0.9.9".to_string(),
@@ -1222,7 +1262,7 @@ mod tests {
 
         let req2 = VersionReq::parse("^0.10.0").unwrap();
         let filtered2 = filter_versions_by_req(versions2, &req2);
-        assert_eq!(filtered2, vec!["0.10.0".to_string(), "0.10.1".to_string()]);
+        assert_eq!(filtered2, Some("0.10.1".to_string()));
     }
 
     /// 验证 crates.io API 可用且能返回非空版本列表（用于回退到 API 的场景）。
