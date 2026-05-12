@@ -43,6 +43,8 @@
 //!  InitialCompileFailed: 是否初始编译失败   (默认 false)
 //!  CargoLockExists: 源码目录中是否存在 Cargo.lock（记录编译前的状态）
 //!  DepUpdateErrors: 依赖更新失败错误信息
+//!  HeavyDepsSkipped: 是否跳过重依赖   (默认 false)
+//!  HeavyDepsCount: 重依赖数量   (默认 0)
 //!
 //! ## crate_versions_index
 //!  Id: 主键，自增
