@@ -54,15 +54,30 @@
 //!
 
 
+/*datahandle-migration是一个单独可执行程序 ，专门做两件事：
+执行数据库迁移 ：把 migration/src/m2026...*.rs 里定义的建表/改表脚本按顺序应用到 Postgres。
+可选：生成实体代码（entities）：迁移完成后，调用外部工具sea-orm-cli generate entity ，
+把数据库表结构反向生成到 datahandle/src/entities/ （SeaORM 的实体结构体）。*/
+
 use dotenvy::dotenv;
 use sea_orm_migration::prelude::*;
 use std::path::PathBuf;
 
+/*- 输入程序启动参数，只要参数里出现 "up" | "fresh" | "fresh" 就返回 true，就代表数据库结构发生变化，需要更新 entities。
+输出 是否要在迁移后自动生成 entities*/
 fn should_update_entities(args: &[String]) -> bool {
     args.iter()
         .any(|arg| matches!(arg.as_str(), "up" | "refresh" | "fresh"))
 }
 
+/*让DATABASE_URL这类环境变量进入进程环境，供后续连接数据库用。
+用env!("CARGO_MANIFEST_DIR")找到当前crate（datahandle/migration）的目录。
+推导出workspace根目录
+按优先级尝试加载两个.env ：
+   - workspace_root/.env（不覆盖已有同名环境变量）
+   - workspace_root/datahandle/data_import/.env（会覆盖已有同名环境变量）
+如果都没加载成功，退回到dotenv()的默认行为（通常是尝试当前工作目录下的 .env ）
+保证你放在 data_import 里的连接串能生效，并且优先级最高 （这就是你后来能稳定连上 rust 库的原因）。*/
 fn load_env() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.join("..").join("..");
@@ -89,12 +104,22 @@ fn load_env() {
     }
 }
 
+/*计算“生成实体代码输出到哪里”。它会取 migration 包的上一级目录（也就是 datahandle/ ）
+然后拼成： datahandle/src/entities/
+也就是最终输出目录： .../datahandle/src/entities*/
 fn entities_output_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let datahandle_dir = manifest_dir.parent().ok_or("invalid manifest dir")?;
     Ok(datahandle_dir.join("src").join("entities"))
 }
 
+/*- 调用外部命令 sea-orm-cli ，根据 DATABASE_URL 连接数据库，生成 entities Rust 文件。
+从环境变量取连接串：let database_url = std::env::var("DATABASE_URL")?;
+获取输出目录并确保存在：entities_output_dir() + create_dir_all
+运行外部命令：sea-orm-cli generate entity -u <DATABASE_URL> -o <entities_dir> --with-serde both --expanded-format
+如果系统里根本没装 sea-orm-cli ， Command::new("sea-orm-cli") 会返回 NotFound 。
+这里选择：打印一句 sea-orm-cli not found, skip entity generation ，然后 直接返回 Ok 。
+这能保证：迁移已经成功时，不会因为“没装生成工具”导致整个命令失败。*/
 fn update_entities() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
     let output_dir = entities_output_dir()?;
