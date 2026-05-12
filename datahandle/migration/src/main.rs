@@ -65,13 +65,28 @@ fn should_update_entities(args: &[String]) -> bool {
 
 fn load_env() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_env = manifest_dir.join("..").join("..").join(".env");
+    let workspace_root = manifest_dir.join("..").join("..");
+    let env_candidates = [
+        (workspace_root.join(".env"), false),
+        (workspace_root.join("datahandle").join("data_import").join(".env"), true),
+    ];
 
-    if dotenvy::from_path(workspace_env).is_ok() {
-        return;
+    let mut loaded_any = false;
+    for (env_path, should_override) in env_candidates {
+        if !env_path.exists() {
+            continue;
+        }
+        let loaded = if should_override {
+            dotenvy::from_path_override(&env_path)
+        } else {
+            dotenvy::from_path(&env_path)
+        };
+        loaded_any |= loaded.is_ok();
     }
 
-    dotenv().ok();
+    if !loaded_any {
+        dotenv().ok();
+    }
 }
 
 fn entities_output_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -85,7 +100,7 @@ fn update_entities() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = entities_output_dir()?;
     std::fs::create_dir_all(&output_dir)?;
 
-    let status = std::process::Command::new("sea-orm-cli")
+    let status = match std::process::Command::new("sea-orm-cli")
         .args([
             "generate",
             "entity",
@@ -97,7 +112,15 @@ fn update_entities() -> Result<(), Box<dyn std::error::Error>> {
             "both",
             "--expanded-format",
         ])
-        .status()?;
+        .status()
+    {
+        Ok(status) => status,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("sea-orm-cli not found, skip entity generation");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     if !status.success() {
         return Err("sea-orm-cli failed".into());
