@@ -6,5 +6,7 @@ logs/
 __pycache__/
 /mkdir/
 /rssembid/
+.env
+.env.*
 data.txt
 crates.txt

@@ -51,12 +51,31 @@ pub fn get_config_once(_load: &ConfigLoad) -> anyhow::Result<&'static Config> {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_env = manifest_dir.parent().unwrap_or(&manifest_dir).join(".env");
-    if workspace_env.exists() {
-        dotenvy::from_path(&workspace_env).map_err(|e| {
+    let workspace_root = manifest_dir.parent().unwrap_or(&manifest_dir);
+    let env_candidates = [
+        (workspace_root.join(".env"), false),
+        (
+            workspace_root
+                .join("datahandle")
+                .join("data_import")
+                .join(".env"),
+            true,
+        ),
+    ];
+
+    for (env_path, should_override) in env_candidates {
+        if !env_path.exists() {
+            continue;
+        }
+        let loaded = if should_override {
+            dotenvy::from_path_override(&env_path)
+        } else {
+            dotenvy::from_path(&env_path)
+        };
+        loaded.map_err(|e| {
             anyhow::anyhow!(
                 "failed to load dotenv from {}: {}",
-                workspace_env.display(),
+                env_path.display(),
                 e
             )
         })?;
