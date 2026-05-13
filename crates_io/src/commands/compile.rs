@@ -11,17 +11,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::fs;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
 use tokio::time::{Duration, timeout};
 
 const COMPILE_BATCH_SIZE: u64 = 2000; //每次从数据库拉取未编译的 crate 数量
-const COMPILE_GROUP_SIZE: usize = 200; // 每次取COMPILE_GROUP_SIZE作为一个并发组
 const HEAVY_DEPS_SKIP_THRESHOLD: usize = 50;
-const CARGO_CMD_TIMEOUT_SECS: u64 = 60 * 30;
+const WORKER_CARGO_HOME_CLEAN_INTERVAL: u64 = 20;
+const CARGO_CMD_TIMEOUT_SECS: u64 = 60 * 20;
 
 // 注意：后续在其他服务器上跑时，可通过修改以下两个常量或引入环境变量来调整：
 // 推荐公式：COMPILE_CONCURRENCY * CARGO_BUILD_JOBS ≈ CPU逻辑核数 (或略大)
@@ -175,9 +174,9 @@ async fn acquire_cargo_cmd_permit<'a>(
 /// 并使用隔离的 CARGO_HOME 避免污染全局缓存。
 ///
 /// 并发逻辑怎么跑的
-/// 外层无限循环 ：每次从 DB 拉一批待编译 crate（ COMPILE_BATCH_SIZE ），再把这批按 COMPILE_GROUP_SIZE 切成若干组，组与组之间是串行处理的（一个组完全跑完才进入下一个组）。
-/// 每个 group 启动固定数量的 worker ： for worker_id in 0..COMPILE_CONCURRENCY 会 spawn 出 COMPILE_CONCURRENCY 个 tokio 任务（worker）。
-/// 动态领活（不平均分配） ：所有 worker 共享一个 next_index: AtomicUsize 。每个 worker 在 loop 里 fetch_add(1) 拿到一个唯一的 i，然后处理 group_items[i] 对应的 crate。谁先跑完谁继续领下一个，直到 i 超过 group_items.len() 才退出。
+/// - 生产者/消费者：主线程持续从 DB 拉取未编译的 crate，并通过 channel 投递给固定数量的 worker。
+/// - worker 常驻：每个 worker 处理完一个 crate 就继续从 channel 取下一个，不再按 group 切分，避免尾部慢 crate 让整组空等。
+/// - 周期清理：每个 worker 每处理 WORKER_CARGO_HOME_CLEAN_INTERVAL 个 crate 清理一次自己的 CARGO_HOME，target_dir 则每 crate 清理一次。
 pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     let config = config::get_config_once()?;
     let download_dir = config.require("DOWNLOAD_DIR")?;
@@ -232,191 +231,200 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
         "using isolated IO directories for experiments"
     );
 
-    tracing::info!("start compile batch run");
+    tracing::info!(
+        concurrency = COMPILE_CONCURRENCY,
+        page_size = COMPILE_BATCH_SIZE,
+        "start compile worker pool (no grouping)"
+    );
 
-    loop {
-        let crates = db
-            .get_uncompiled_crates(COMPILE_BATCH_SIZE)
-            .await
-            .context("failed to load uncompiled crates")?;
-        tracing::info!(
-            batch_size = COMPILE_BATCH_SIZE,
-            fetched = crates.len(),
-            "loaded uncompiled crates batch"
-        );
+    type CompileItem = (i32, String, String, PathBuf);
 
-        if crates.is_empty() {
-            break;
+    let (tx, rx) = mpsc::channel::<CompileItem>(COMPILE_CONCURRENCY * 2);
+    let rx = Arc::new(Mutex::new(rx));
+
+    let producer_db = db.clone();
+    let producer_download_dir = download_dir.clone();
+    let producer_tx = tx.clone();
+    let producer = tokio::spawn(async move {
+        let mut after_id: i32 = 0;
+        loop {
+            let rows = producer_db
+                .get_uncompiled_crates_after_id(COMPILE_BATCH_SIZE, after_id)
+                .await
+                .context("failed to load uncompiled crates page")?;
+            if rows.is_empty() {
+                tracing::info!(after_id, stage = "producer_done", "compile stage");
+                break;
+            }
+            tracing::info!(
+                after_id,
+                fetched = rows.len(),
+                stage = "producer_fetched",
+                "compile stage"
+            );
+            for row in rows {
+                let crate_dir =
+                    get_crate_file_path(&producer_download_dir, &row.name, &row.version_new)
+                        .with_extension("");
+                after_id = row.id;
+                if producer_tx
+                    .send((row.id, row.name, row.version_new, crate_dir))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut worker_tasks = Vec::with_capacity(COMPILE_CONCURRENCY);
+    for worker_id in 0..COMPILE_CONCURRENCY {
+        let db = db.clone();
+        let rx = rx.clone();
+        let cargo_home = experiment_cargo_home.join(format!("worker_{:02}", worker_id));
+        let target_dir = cargo_target_base.join(format!("worker_{:02}", worker_id));
+
+        if !cargo_home.exists() {
+            fs::create_dir_all(&cargo_home).await?;
+        }
+        if !target_dir.exists() {
+            fs::create_dir_all(&target_dir).await?;
         }
 
-        let total_start = Instant::now();
-        for (group_no, group) in crates.chunks(COMPILE_GROUP_SIZE).enumerate() {
-            let group_no: u64 = (group_no + 1).try_into().unwrap_or(u64::MAX);
-            tracing::info!(
-                group_no,
-                group_size = group.len(),
-                concurrency = COMPILE_CONCURRENCY,
-                stage = "group_start",
-                "start handling compile group"
-            );
+        let task = tokio::spawn(async move {
+            let cargo_cmd_semaphore = Semaphore::new(1);
+            let mut handled_since_cleanup: u64 = 0;
+            loop {
+                let item = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+                let Some((crate_id, crate_name, version_new, crate_dir)) = item else {
+                    break;
+                };
 
-            let group_items: Vec<(i32, String, String, PathBuf)> = group
-                .iter()
-                .map(|m| {
-                    let crate_dir = get_crate_file_path(&download_dir, &m.name, &m.version_new)
-                        .with_extension("");
-                    (m.id, m.name.clone(), m.version_new.clone(), crate_dir)
-                })
-                .collect();
-            let group_items = Arc::new(group_items);
-            let next_index = Arc::new(AtomicUsize::new(0));
+                let crate_start = Instant::now();
+                tracing::info!(
+                    crate_id,
+                    crate_name = %crate_name,
+                    version_new = %version_new,
+                    crate_dir = %crate_dir.display(),
+                    target_dir = %target_dir.display(),
+                    stage = "crate_start",
+                    "crate stage"
+                );
 
-            let mut worker_tasks = Vec::with_capacity(COMPILE_CONCURRENCY);
-            let mut worker_cargo_homes = Vec::with_capacity(COMPILE_CONCURRENCY);
-            let mut worker_target_dirs = Vec::with_capacity(COMPILE_CONCURRENCY);
+                let process_result = process_single_crate_compile(
+                    &db,
+                    &crate_dir,
+                    &cargo_home,
+                    &target_dir,
+                    &cargo_cmd_semaphore,
+                    crate_id,
+                    &crate_name,
+                    &version_new,
+                )
+                .await;
 
-            for worker_id in 0..COMPILE_CONCURRENCY {
-                let db = db.clone();
-                let cargo_home = experiment_cargo_home.join(format!("worker_{:02}", worker_id));
-                let target_dir = cargo_target_base.join(format!("worker_{:02}", worker_id));
-
-                if !cargo_home.exists() {
-                    fs::create_dir_all(&cargo_home).await?;
+                if let Err(err) = process_result {
+                    tracing::error!(
+                        crate_id,
+                        crate_name = %crate_name,
+                        error = ?err,
+                        "failed to compile crate"
+                    );
                 }
-                if !target_dir.exists() {
-                    fs::create_dir_all(&target_dir).await?;
-                }
 
-                worker_cargo_homes.push(cargo_home.clone());
-                worker_target_dirs.push(target_dir.clone());
-
-                let group_items = group_items.clone();
-                let next_index = next_index.clone();
-                let worker_id: usize = worker_id;
-
-                let task = tokio::spawn(async move {
-                    let cargo_cmd_semaphore = Semaphore::new(1);
-                    loop {
-                        let i = next_index.fetch_add(1, Ordering::Relaxed);
-                        if i >= group_items.len() {
-                            break;
-                        }
-                        let (crate_id, crate_name, version_new, crate_dir) = &group_items[i];
-                        let crate_start = Instant::now();
-
-                        tracing::info!(
-                            crate_id = *crate_id,
+                if crate_dir.exists() {
+                    if let Err(err) = cargo_clean(
+                        crate_id,
+                        &crate_name,
+                        &crate_dir,
+                        &cargo_home,
+                        &target_dir,
+                        &cargo_cmd_semaphore,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            crate_id,
                             crate_name = %crate_name,
-                            version_new = %version_new,
-                            crate_dir = %crate_dir.display(),
-                            target_dir = %target_dir.display(),
-                            stage = "crate_start",
-                            "crate stage"
-                        );
-
-                        let process_result = process_single_crate_compile(
-                            &db,
-                            &crate_dir,
-                            &cargo_home,
-                            &target_dir,
-                            &cargo_cmd_semaphore,
-                            *crate_id,
-                            crate_name,
-                            version_new,
-                        )
-                        .await;
-
-                        if let Err(err) = process_result {
-                            tracing::error!(
-                                crate_id = *crate_id,
-                                crate_name = %crate_name,
-                                error = ?err,
-                                "failed to compile crate"
-                            );
-                        }
-
-                        if crate_dir.exists() {
-                            if let Err(err) = cargo_clean(
-                                *crate_id,
-                                crate_name,
-                                &crate_dir,
-                                &cargo_home,
-                                &target_dir,
-                                &cargo_cmd_semaphore,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    crate_id = *crate_id,
-                                    crate_name = %crate_name,
-                                    error = ?err,
-                                    "failed to cargo clean crate dir"
-                                );
-                            }
-                        }
-
-                        if let Err(err) = db.mark_crate_compile_handled(*crate_id).await {
-                            tracing::error!(
-                                crate_id = *crate_id,
-                                crate_name = %crate_name,
-                                error = ?err,
-                                "failed to mark crate as compile handled"
-                            );
-                        }
-                        tracing::info!(
-                            crate_id = *crate_id,
-                            crate_name = %crate_name,
-                            version_new = %version_new,
-                            elapsed_ms = crate_start.elapsed().as_millis(),
-                            stage = "crate_done",
-                            "crate stage"
+                            error = ?err,
+                            "failed to cargo clean crate dir"
                         );
                     }
+                }
 
+                if let Err(err) = db.mark_crate_compile_handled(crate_id).await {
+                    tracing::error!(
+                        crate_id,
+                        crate_name = %crate_name,
+                        error = ?err,
+                        "failed to mark crate as compile handled"
+                    );
+                }
+
+                handled_since_cleanup += 1;
+                if handled_since_cleanup % WORKER_CARGO_HOME_CLEAN_INTERVAL == 0 {
                     tracing::info!(
                         worker_id,
                         cargo_home = %cargo_home.display(),
-                        stage = "worker_cargo_home_cleanup_start",
+                        handled_since_cleanup,
+                        stage = "worker_cargo_home_periodic_cleanup_start",
                         "compile stage"
                     );
                     cleanup_cargo_cache(&cargo_home).await;
                     tracing::info!(
                         worker_id,
                         cargo_home = %cargo_home.display(),
-                        stage = "worker_cargo_home_cleanup_done",
+                        handled_since_cleanup,
+                        stage = "worker_cargo_home_periodic_cleanup_done",
                         "compile stage"
                     );
-                });
-
-                worker_tasks.push(task);
-            }
-
-            for task in worker_tasks {
-                if let Err(err) = task.await {
-                    tracing::error!(error = ?err, "compile worker task panicked");
                 }
+
+                tracing::info!(
+                    crate_id,
+                    crate_name = %crate_name,
+                    version_new = %version_new,
+                    elapsed_ms = crate_start.elapsed().as_millis(),
+                    stage = "crate_done",
+                    "crate stage"
+                );
             }
 
             tracing::info!(
-                group_no,
-                stage = "group_cleanup_start",
-                "compile group stage"
+                worker_id,
+                cargo_home = %cargo_home.display(),
+                stage = "worker_cargo_home_cleanup_start",
+                "compile stage"
             );
-            for target_dir in &worker_target_dirs {
-                let _ = cleanup_dir_contents(target_dir).await;
-            }
+            cleanup_cargo_cache(&cargo_home).await;
             tracing::info!(
-                group_no,
-                elapsed_ms = total_start.elapsed().as_millis(),
-                stage = "group_cleanup_done",
-                "compile group stage"
+                worker_id,
+                cargo_home = %cargo_home.display(),
+                stage = "worker_cargo_home_cleanup_done",
+                "compile stage"
             );
+        });
+        worker_tasks.push(task);
+    }
+
+    drop(tx);
+
+    if let Err(err) = producer.await {
+        tracing::error!(error = ?err, "compile producer task panicked");
+    }
+
+    for task in worker_tasks {
+        if let Err(err) = task.await {
+            tracing::error!(error = ?err, "compile worker task panicked");
         }
     }
 
-    tracing::info!("compile batch finished, removing isolated CARGO_HOME entirely");
-    let _ = fs::remove_dir_all(&cargo_target_base).await;
-    let _ = fs::remove_dir_all(&experiment_cargo_home).await;
+    tracing::info!("compile run finished");
 
     Ok(())
 }

@@ -21,7 +21,7 @@ use sea_orm::DbErr;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect,
+    QueryOrder, QuerySelect,
 };
 
 #[derive(Debug, Clone)]
@@ -120,20 +120,17 @@ impl PgDataHandle {
             .await
     }
 
-    /// 获取尚未进行编译验证的 crate 列表,用于"编译任务"
-    ///
-    /// 用于编译任务：
-    /// - 仅挑选 download=true（已下载）
-    /// - 且 compile_handled=false（还没被“尝试编译””）
-    /// - 且 version_handled=true（已处理依赖版本信息）
-    pub async fn get_uncompiled_crates(
+    pub async fn get_uncompiled_crates_after_id(
         &self,
         limit: u64,
+        after_id: i32,
     ) -> Result<Vec<crates::Model>, sea_orm::DbErr> {
         crates::Entity::find()
             .filter(crates::Column::Download.eq(true))
             .filter(crates::Column::CompileHandled.eq(false))
             .filter(crates::Column::VersionHandled.eq(true))
+            .filter(crates::Column::Id.gt(after_id))
+            .order_by_asc(crates::Column::Id)
             .limit(limit)
             .all(self.get_connection())
             .await
