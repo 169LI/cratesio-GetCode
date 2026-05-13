@@ -36,16 +36,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ConfigLoad;
-
-impl ConfigLoad {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-pub fn get_config_once(_load: &ConfigLoad) -> anyhow::Result<&'static Config> {
+pub fn get_config_once() -> anyhow::Result<&'static Config> {
     if let Some(config) = CONFIG.get() {
         return Ok(config);
     }
@@ -115,6 +106,46 @@ mod tests {
             index_dir.is_dir(),
             "CRATESIO_INDEX_DIR must be an existing directory: {}",
             index_dir.display()
+        );
+
+        let cargo_target_base_raw = std::env::var("CARGO_TARGET_BASE_DIR").unwrap_or_else(|_| {
+            panic!(
+                "missing env: CARGO_TARGET_BASE_DIR (loaded from {})",
+                workspace_env.display()
+            )
+        });
+        let cargo_target_base = PathBuf::from(cargo_target_base_raw);
+        std::fs::create_dir_all(&cargo_target_base).unwrap_or_else(|e| {
+            panic!(
+                "failed to create CARGO_TARGET_BASE_DIR {}: {}",
+                cargo_target_base.display(),
+                e
+            )
+        });
+        assert!(
+            cargo_target_base.is_dir(),
+            "CARGO_TARGET_BASE_DIR must be an existing directory: {}",
+            cargo_target_base.display()
+        );
+
+        let cargo_home_base_raw = std::env::var("CARGO_HOME_BASE_DIR").unwrap_or_else(|_| {
+            panic!(
+                "missing env: CARGO_HOME_BASE_DIR (loaded from {})",
+                workspace_env.display()
+            )
+        });
+        let cargo_home_base = PathBuf::from(cargo_home_base_raw);
+        std::fs::create_dir_all(&cargo_home_base).unwrap_or_else(|e| {
+            panic!(
+                "failed to create CARGO_HOME_BASE_DIR {}: {}",
+                cargo_home_base.display(),
+                e
+            )
+        });
+        assert!(
+            cargo_home_base.is_dir(),
+            "CARGO_HOME_BASE_DIR must be an existing directory: {}",
+            cargo_home_base.display()
         );
     }
 }

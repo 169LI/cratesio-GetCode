@@ -13,7 +13,7 @@
 //!
 
 use crate::cli::DataBatchCli;
-use crate::config::{self, ConfigLoad};
+use crate::config;
 use crate::pgdatahandle::{CrateImportRow, CrateVersionIndexRow, PgDataHandle};
 use anyhow::Context;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
@@ -128,7 +128,7 @@ LIMIT {}
 ///     - `git switch --detach aa05e85408df56286b0c8de5591b70dd7a1ffc19`
 async fn handle_version(db: &PgDataHandle) -> anyhow::Result<()> {
     tracing::info!("start handle crate version index");
-    let config = config::get_config_once(&ConfigLoad::new())?;
+    let config = config::get_config_once()?;
     let index_root = PathBuf::from(config.require("CRATESIO_INDEX_DIR")?);
 
     let crates = db

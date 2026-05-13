@@ -213,6 +213,30 @@ impl PgDataHandle {
         Ok(())
     }
 
+    pub async fn mark_heavy_deps_skipped(
+        &self,
+        id: i32,
+        deps_count: i32,
+    ) -> Result<(), sea_orm::DbErr> {
+        crates::Entity::update_many()
+            .col_expr(
+                crates::Column::CompileHandled,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .col_expr(
+                crates::Column::HeavyDepsSkipped,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .col_expr(
+                crates::Column::HeavyDepsCount,
+                sea_orm::sea_query::Expr::value(deps_count),
+            )
+            .filter(crates::Column::Id.eq(id))
+            .exec(self.get_connection())
+            .await?;
+        Ok(())
+    }
+
     /// 记录 crate 是否存在 Cargo.lock 文件
     pub async fn record_cargo_lock_exists(
         &self,
