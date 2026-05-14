@@ -18,6 +18,8 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+
+/*列出程序支持的一级子命令，决定调用哪个模块*/
 pub enum Commands {
     Download,
     Compile,
