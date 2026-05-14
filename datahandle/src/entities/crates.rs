@@ -27,6 +27,8 @@ pub struct Model {
     pub compile_handled: bool,
     pub initial_compile_failed: bool,
     pub cargo_lock_exists: i32,
+    pub heavy_deps_skipped: bool,
+    pub heavy_deps_count: i32,
     pub dep_update_errors: Option<Json>,
 }
 
@@ -45,6 +47,8 @@ pub enum Column {
     CompileHandled,
     InitialCompileFailed,
     CargoLockExists,
+    HeavyDepsSkipped,
+    HeavyDepsCount,
     DepUpdateErrors,
 }
 
@@ -82,6 +86,8 @@ impl ColumnTrait for Column {
             Self::CompileHandled => ColumnType::Boolean.def(),
             Self::InitialCompileFailed => ColumnType::Boolean.def(),
             Self::CargoLockExists => ColumnType::Integer.def(),
+            Self::HeavyDepsSkipped => ColumnType::Boolean.def(),
+            Self::HeavyDepsCount => ColumnType::Integer.def(),
             Self::DepUpdateErrors => ColumnType::JsonBinary.def().null(),
         }
     }
