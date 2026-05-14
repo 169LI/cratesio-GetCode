@@ -103,6 +103,18 @@ struct IndexDepsByKind {
     dev: Vec<DependencyInfo>,
 }
 
+#[derive(Clone, Copy)]
+struct CompileCtx<'a> {
+    db: &'a PgDataHandle,
+    crate_id: i32,
+    crate_name: &'a str,
+    latest_version: &'a str,
+    crate_dir: &'a Path,
+    cargo_home: &'a Path,
+    target_dir: &'a Path,
+    cargo_cmd_semaphore: &'a Semaphore,
+}
+
 /// 确保指定的 rust toolchain 已安装，避免并发时多个进程同时触发 rustup 导致报错
 #[allow(unused)]
 async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
@@ -140,31 +152,16 @@ async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
 
 async fn acquire_cargo_cmd_permit<'a>(
     cargo_cmd_semaphore: &'a Semaphore,
-    crate_id: i32,
-    crate_name: &str,
-    stage: &'static str,
+    _crate_id: i32,
+    _crate_name: &str,
+    _stage: &'static str,
 ) -> anyhow::Result<SemaphorePermit<'a>> {
     match cargo_cmd_semaphore.try_acquire() {
         Ok(p) => Ok(p),
-        Err(_) => {
-            tracing::info!(
-                crate_id,
-                crate_name = %crate_name,
-                stage,
-                "waiting for cargo command lock"
-            );
-            let p = cargo_cmd_semaphore
-                .acquire()
-                .await
-                .map_err(|_| anyhow::anyhow!("failed to acquire cargo command permit"))?;
-            tracing::info!(
-                crate_id,
-                crate_name = %crate_name,
-                stage,
-                "cargo command lock acquired"
-            );
-            Ok(p)
-        }
+        Err(_) => cargo_cmd_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to acquire cargo command permit")),
     }
 }
 
@@ -185,14 +182,14 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     let cargo_target_base = PathBuf::from(
         config
             .get("CARGO_TARGET_BASE_DIR")
-            .unwrap_or_else(|| "/var/tmp/cargo-target"),
+            .unwrap_or("/var/tmp/cargo-target"),
     );
 
     // CARGO_HOME：挪到与 CARGO_TARGET_DIR 同一盘（例如 /var/tmp 在 sdb2），将 registry/src/git 的大量读写从 /mnt/data 分流
     let cargo_home_base = PathBuf::from(
         config
             .get("CARGO_HOME_BASE_DIR")
-            .unwrap_or_else(|| "/var/tmp/cargo-home"),
+            .unwrap_or("/var/tmp/cargo-home"),
     );
     if !cargo_home_base.exists() {
         fs::create_dir_all(&cargo_home_base).await?;
@@ -316,17 +313,17 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
                     "crate stage"
                 );
 
-                let process_result = process_single_crate_compile(
-                    &db,
-                    &crate_dir,
-                    &cargo_home,
-                    &target_dir,
-                    &cargo_cmd_semaphore,
+                let compile_ctx = CompileCtx {
+                    db: &db,
                     crate_id,
-                    &crate_name,
-                    &version_new,
-                )
-                .await;
+                    crate_name: &crate_name,
+                    latest_version: &version_new,
+                    crate_dir: &crate_dir,
+                    cargo_home: &cargo_home,
+                    target_dir: &target_dir,
+                    cargo_cmd_semaphore: &cargo_cmd_semaphore,
+                };
+                let process_result = process_single_crate_compile(compile_ctx).await;
 
                 if let Err(err) = process_result {
                     tracing::error!(
@@ -337,8 +334,8 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
                     );
                 }
 
-                if crate_dir.exists() {
-                    if let Err(err) = cargo_clean(
+                if crate_dir.exists()
+                    && let Err(err) = cargo_clean(
                         crate_id,
                         &crate_name,
                         &crate_dir,
@@ -347,14 +344,13 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
                         &cargo_cmd_semaphore,
                     )
                     .await
-                    {
-                        tracing::warn!(
-                            crate_id,
-                            crate_name = %crate_name,
-                            error = ?err,
-                            "failed to cargo clean crate dir"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        crate_id,
+                        crate_name = %crate_name,
+                        error = ?err,
+                        "failed to cargo clean crate dir"
+                    );
                 }
 
                 if let Err(err) = db.mark_crate_compile_handled(crate_id).await {
@@ -367,14 +363,7 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
                 }
 
                 handled_since_cleanup += 1;
-                if handled_since_cleanup % WORKER_CARGO_HOME_CLEAN_INTERVAL == 0 {
-                    tracing::info!(
-                        worker_id,
-                        cargo_home = %cargo_home.display(),
-                        handled_since_cleanup,
-                        stage = "worker_cargo_home_periodic_cleanup_start",
-                        "compile stage"
-                    );
+                if handled_since_cleanup.is_multiple_of(WORKER_CARGO_HOME_CLEAN_INTERVAL) {
                     cleanup_cargo_cache(&cargo_home).await;
                     tracing::info!(
                         worker_id,
@@ -395,12 +384,6 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
                 );
             }
 
-            tracing::info!(
-                worker_id,
-                cargo_home = %cargo_home.display(),
-                stage = "worker_cargo_home_cleanup_start",
-                "compile stage"
-            );
             cleanup_cargo_cache(&cargo_home).await;
             tracing::info!(
                 worker_id,
@@ -439,15 +422,6 @@ async fn cargo_clean(
 ) -> anyhow::Result<()> {
     let _ = cargo_cmd_semaphore;
     let _ = cargo_home;
-    tracing::info!(
-        crate_id,
-        crate_name = %crate_name,
-        crate_dir = %crate_dir.display(),
-        target_dir = %target_dir.display(),
-        stage = "target_cleanup_start",
-        "crate stage"
-    );
-
     let clean_start = Instant::now();
     let _ = cleanup_dir_contents(target_dir).await;
     tracing::info!(
@@ -464,11 +438,6 @@ async fn cargo_clean(
 
 /// 清理给定 CARGO_HOME 中的源码缓存，保留 index 索引以加速后续构建
 async fn cleanup_cargo_cache(cargo_home: &Path) {
-    tracing::info!(
-        cargo_home = %cargo_home.display(),
-        stage = "cargo_home_cleanup_start",
-        "compile stage"
-    );
     let registry_cache = cargo_home.join("registry").join("cache");
     let registry_src = cargo_home.join("registry").join("src");
     let git_checkouts = cargo_home.join("git").join("checkouts");
@@ -500,35 +469,27 @@ async fn cleanup_cargo_cache(cargo_home: &Path) {
 /// - crate_name: 要编译的 crate 的名称
 /// - latest_version: 要编译的 crate 的最新版本
 ///
-async fn process_single_crate_compile(
-    db: &PgDataHandle,
-    crate_dir: &Path,
-    cargo_home: &Path,
-    target_dir: &Path,
-    cargo_cmd_semaphore: &Semaphore,
-    crate_id: i32,
-    crate_name: &str,
-    latest_version: &str,
-) -> anyhow::Result<()> {
-    if !crate_dir.exists() || !crate_dir.is_dir() {
+async fn process_single_crate_compile(ctx: CompileCtx<'_>) -> anyhow::Result<()> {
+    if !ctx.crate_dir.exists() || !ctx.crate_dir.is_dir() {
         return Err(anyhow::anyhow!(
             "Crate directory not found: {}",
-            crate_dir.display()
+            ctx.crate_dir.display()
         ));
     }
 
     tracing::info!(
-        crate_id,
-        crate_name = %crate_name,
-        latest_version = %latest_version,
-        crate_dir = %crate_dir.display(),
+        crate_id = ctx.crate_id,
+        crate_name = %ctx.crate_name,
+        latest_version = %ctx.latest_version,
+        crate_dir = %ctx.crate_dir.display(),
         stage = "crate_enter",
         "crate stage"
     );
 
     // 2. 从数据库查询该版本的依赖信息
-    let index_row = db
-        .get_crate_latest_dependencies(crate_id, latest_version)
+    let index_row = ctx
+        .db
+        .get_crate_latest_dependencies(ctx.crate_id, ctx.latest_version)
         .await?;
 
     let deps_json = match index_row {
@@ -536,8 +497,8 @@ async fn process_single_crate_compile(
         None => {
             tracing::warn!(
                 "未找到 {} v{} 的依赖索引信息，跳过",
-                crate_name,
-                latest_version
+                ctx.crate_name,
+                ctx.latest_version
             );
             return Ok(());
         }
@@ -548,15 +509,16 @@ async fn process_single_crate_compile(
 
     if deps_total > HEAVY_DEPS_SKIP_THRESHOLD {
         tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            latest_version = %latest_version,
+            crate_id = ctx.crate_id,
+            crate_name = %ctx.crate_name,
+            latest_version = %ctx.latest_version,
             deps_total,
             threshold = HEAVY_DEPS_SKIP_THRESHOLD,
             stage = "skip_heavy_deps",
             "skip crate due to heavy dependencies"
         );
-        db.mark_heavy_deps_skipped(crate_id, deps_total.try_into().unwrap_or(i32::MAX))
+        ctx.db
+            .mark_heavy_deps_skipped(ctx.crate_id, deps_total.try_into().unwrap_or(i32::MAX))
             .await?;
         return Ok(());
     }
@@ -566,47 +528,28 @@ async fn process_single_crate_compile(
         && deps_by_kind.dev.is_empty()
     {
         tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
+            crate_id = ctx.crate_id,
+            crate_name = %ctx.crate_name,
             stage = "skip_no_deps",
             "no dependencies found in index deps, skip baseline and update experiments"
         );
         return Ok(());
     }
 
-    let baseline_ok = initial_compile_check(
-        db,
-        crate_id,
-        crate_name,
-        crate_dir,
-        cargo_home,
-        target_dir,
-        cargo_cmd_semaphore,
-        &deps_by_kind,
-    )
-    .await?;
+    let baseline_ok = initial_compile_check(ctx, &deps_by_kind).await?;
 
     // 2. 初始编译验证 (Baseline)
     if !baseline_ok {
-        tracing::warn!("初始编译失败，跳过依赖更新实验: {}", crate_name);
-        db.mark_initial_compile_failed(crate_id).await?;
+        tracing::warn!("初始编译失败，跳过依赖更新实验: {}", ctx.crate_name);
+        ctx.db.mark_initial_compile_failed(ctx.crate_id).await?;
         return Ok(());
     }
 
     //3. 逐版本升级实验  调整为：每个依赖只测当前项目下允许更新到的最新的一个版本
-    let summary = run_stepwise_upgrade_experiments(
-        db,
-        crate_id,
-        crate_name,
-        &crate_dir,
-        cargo_home,
-        target_dir,
-        cargo_cmd_semaphore,
-        &deps_by_kind,
-    )
-    .await?;
+    let summary = run_stepwise_upgrade_experiments(ctx, &deps_by_kind).await?;
 
-    db.record_compile_result(crate_id, summary.errors_json)
+    ctx.db
+        .record_compile_result(ctx.crate_id, summary.errors_json)
         .await?;
 
     Ok(())
@@ -654,26 +597,21 @@ fn collect_deps_by_kind_from_index_deps(deps_json: &serde_json::Value) -> IndexD
 
 /// 对 crate 当前状态做 baseline 编译验证，并生成/刷新 baseline 的 Cargo.toml/Cargo.lock 备份。
 async fn initial_compile_check(
-    db: &PgDataHandle,
-    crate_id: i32,
-    crate_name: &str,
-    crate_dir: &Path,
-    cargo_home: &Path,
-    target_dir: &Path,
-    cargo_cmd_semaphore: &Semaphore,
+    ctx: CompileCtx<'_>,
     deps_by_kind: &IndexDepsByKind,
 ) -> anyhow::Result<bool> {
-    let cargo_toml = crate_dir.join("Cargo.toml");
+    let cargo_toml = ctx.crate_dir.join("Cargo.toml");
     if !cargo_toml.exists() {
         return Ok(false);
     }
 
-    let cargo_lock = crate_dir.join("Cargo.lock");
-    let cargo_lock_baseline = crate_dir.join("Cargo.lock.baseline");
+    let cargo_lock = ctx.crate_dir.join("Cargo.lock");
+    let cargo_lock_baseline = ctx.crate_dir.join("Cargo.lock.baseline");
     let cargo_lock_baseline_exists = cargo_lock_baseline.exists();
     let cargo_lock_exists = if cargo_lock.exists() { 1 } else { 2 };
     if !cargo_lock_baseline_exists {
-        db.record_cargo_lock_exists(crate_id, cargo_lock_exists)
+        ctx.db
+            .record_cargo_lock_exists(ctx.crate_id, cargo_lock_exists)
             .await?;
     }
 
@@ -690,28 +628,26 @@ async fn initial_compile_check(
     if cargo_lock.exists() {
         fs::copy(&cargo_lock, &cargo_lock_baseline).await?;
 
-        let _permit =
-            acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "baseline_build")
-                .await?;
-        tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            stage = "baseline_build_start",
-            "crate stage"
-        );
+        let _permit = acquire_cargo_cmd_permit(
+            ctx.cargo_cmd_semaphore,
+            ctx.crate_id,
+            ctx.crate_name,
+            "baseline_build",
+        )
+        .await?;
         let build_start = Instant::now();
         let status = match run_cargo_status_timeout(
-            crate_id,
-            crate_name,
+            ctx.crate_id,
+            ctx.crate_name,
             "baseline_build_spawned",
             "baseline_build_timeout",
             CARGO_CMD_TIMEOUT_SECS,
             {
                 let mut cmd = TokioCommand::new("cargo");
                 cmd.args(["+1.95.0", "build", "--locked"])
-                    .current_dir(crate_dir)
-                    .env("CARGO_HOME", cargo_home)
-                    .env("CARGO_TARGET_DIR", target_dir)
+                    .current_dir(ctx.crate_dir)
+                    .env("CARGO_HOME", ctx.cargo_home)
+                    .env("CARGO_TARGET_DIR", ctx.target_dir)
                     .env("CARGO_INCREMENTAL", "0")
                     .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                 cmd
@@ -722,9 +658,9 @@ async fn initial_compile_check(
             Ok(s) => s,
             Err(err) => {
                 tracing::info!(
-                    crate_id,
-                    crate_name = %crate_name,
-                    crate_dir = %crate_dir.display(),
+                    crate_id = ctx.crate_id,
+                    crate_name = %ctx.crate_name,
+                    crate_dir = %ctx.crate_dir.display(),
                     ok = false,
                     error = ?err,
                     elapsed_ms = build_start.elapsed().as_millis(),
@@ -735,9 +671,9 @@ async fn initial_compile_check(
             }
         };
         tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            crate_dir = %crate_dir.display(),
+            crate_id = ctx.crate_id,
+            crate_name = %ctx.crate_name,
+            crate_dir = %ctx.crate_dir.display(),
             ok = status.success(),
             elapsed_ms = build_start.elapsed().as_millis(),
             stage = "baseline_build_done",
@@ -748,32 +684,25 @@ async fn initial_compile_check(
         }
     } else {
         let _permit = acquire_cargo_cmd_permit(
-            cargo_cmd_semaphore,
-            crate_id,
-            crate_name,
+            ctx.cargo_cmd_semaphore,
+            ctx.crate_id,
+            ctx.crate_name,
             "baseline_build_init",
         )
         .await?;
-        tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            stage = "baseline_build_start",
-            locked = false,
-            "crate stage"
-        );
         let init_start = Instant::now();
         let init_status = match run_cargo_status_timeout(
-            crate_id,
-            crate_name,
+            ctx.crate_id,
+            ctx.crate_name,
             "baseline_build_spawned",
             "baseline_build_timeout",
             CARGO_CMD_TIMEOUT_SECS,
             {
                 let mut cmd = TokioCommand::new("cargo");
                 cmd.args(["+1.95.0", "build"])
-                    .current_dir(crate_dir)
-                    .env("CARGO_HOME", cargo_home)
-                    .env("CARGO_TARGET_DIR", target_dir)
+                    .current_dir(ctx.crate_dir)
+                    .env("CARGO_HOME", ctx.cargo_home)
+                    .env("CARGO_TARGET_DIR", ctx.target_dir)
                     .env("CARGO_INCREMENTAL", "0")
                     .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                 cmd
@@ -784,9 +713,9 @@ async fn initial_compile_check(
             Ok(s) => s,
             Err(err) => {
                 tracing::info!(
-                    crate_id,
-                    crate_name = %crate_name,
-                    crate_dir = %crate_dir.display(),
+                    crate_id = ctx.crate_id,
+                    crate_name = %ctx.crate_name,
+                    crate_dir = %ctx.crate_dir.display(),
                     ok = false,
                     error = ?err,
                     cargo_lock_now_exists = cargo_lock.exists(),
@@ -798,9 +727,9 @@ async fn initial_compile_check(
             }
         };
         tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            crate_dir = %crate_dir.display(),
+            crate_id = ctx.crate_id,
+            crate_name = %ctx.crate_name,
+            crate_dir = %ctx.crate_dir.display(),
             ok = init_status.success(),
             cargo_lock_now_exists = cargo_lock.exists(),
             elapsed_ms = init_start.elapsed().as_millis(),
@@ -814,28 +743,26 @@ async fn initial_compile_check(
     }
 
     if need_dev {
-        let _permit =
-            acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "baseline_test")
-                .await?;
-        tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            stage = "baseline_test_start",
-            "crate stage"
-        );
+        let _permit = acquire_cargo_cmd_permit(
+            ctx.cargo_cmd_semaphore,
+            ctx.crate_id,
+            ctx.crate_name,
+            "baseline_test",
+        )
+        .await?;
         let test_start = Instant::now();
         let test_status = match run_cargo_status_timeout(
-            crate_id,
-            crate_name,
+            ctx.crate_id,
+            ctx.crate_name,
             "baseline_test_spawned",
             "baseline_test_timeout",
             CARGO_CMD_TIMEOUT_SECS,
             {
                 let mut cmd = TokioCommand::new("cargo");
                 cmd.args(["+1.95.0", "test", "--no-run", "--locked"])
-                    .current_dir(crate_dir)
-                    .env("CARGO_HOME", cargo_home)
-                    .env("CARGO_TARGET_DIR", target_dir)
+                    .current_dir(ctx.crate_dir)
+                    .env("CARGO_HOME", ctx.cargo_home)
+                    .env("CARGO_TARGET_DIR", ctx.target_dir)
                     .env("CARGO_INCREMENTAL", "0")
                     .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                 cmd
@@ -846,9 +773,9 @@ async fn initial_compile_check(
             Ok(s) => s,
             Err(err) => {
                 tracing::info!(
-                    crate_id,
-                    crate_name = %crate_name,
-                    crate_dir = %crate_dir.display(),
+                    crate_id = ctx.crate_id,
+                    crate_name = %ctx.crate_name,
+                    crate_dir = %ctx.crate_dir.display(),
                     ok = false,
                     error = ?err,
                     elapsed_ms = test_start.elapsed().as_millis(),
@@ -859,9 +786,9 @@ async fn initial_compile_check(
             }
         };
         tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            crate_dir = %crate_dir.display(),
+            crate_id = ctx.crate_id,
+            crate_name = %ctx.crate_name,
+            crate_dir = %ctx.crate_dir.display(),
             ok = test_status.success(),
             elapsed_ms = test_start.elapsed().as_millis(),
             stage = "baseline_test_done",
@@ -871,25 +798,19 @@ async fn initial_compile_check(
             return Ok(false);
         }
 
-        tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            stage = "baseline_bench_start",
-            "crate stage"
-        );
         let bench_start = Instant::now();
         let bench_status = match run_cargo_status_timeout(
-            crate_id,
-            crate_name,
+            ctx.crate_id,
+            ctx.crate_name,
             "baseline_bench_spawned",
             "baseline_bench_timeout",
             CARGO_CMD_TIMEOUT_SECS,
             {
                 let mut cmd = TokioCommand::new("cargo");
                 cmd.args(["+1.95.0", "bench", "--no-run", "--locked"])
-                    .current_dir(crate_dir)
-                    .env("CARGO_HOME", cargo_home)
-                    .env("CARGO_TARGET_DIR", target_dir)
+                    .current_dir(ctx.crate_dir)
+                    .env("CARGO_HOME", ctx.cargo_home)
+                    .env("CARGO_TARGET_DIR", ctx.target_dir)
                     .env("CARGO_INCREMENTAL", "0")
                     .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                 cmd
@@ -900,9 +821,9 @@ async fn initial_compile_check(
             Ok(s) => s,
             Err(err) => {
                 tracing::info!(
-                    crate_id,
-                    crate_name = %crate_name,
-                    crate_dir = %crate_dir.display(),
+                    crate_id = ctx.crate_id,
+                    crate_name = %ctx.crate_name,
+                    crate_dir = %ctx.crate_dir.display(),
                     ok = false,
                     error = ?err,
                     elapsed_ms = bench_start.elapsed().as_millis(),
@@ -913,9 +834,9 @@ async fn initial_compile_check(
             }
         };
         tracing::info!(
-            crate_id,
-            crate_name = %crate_name,
-            crate_dir = %crate_dir.display(),
+            crate_id = ctx.crate_id,
+            crate_name = %ctx.crate_name,
+            crate_dir = %ctx.crate_dir.display(),
             ok = bench_status.success(),
             elapsed_ms = bench_start.elapsed().as_millis(),
             stage = "baseline_bench_done",
@@ -925,7 +846,7 @@ async fn initial_compile_check(
             return Ok(false);
         }
     }
-    let cargo_toml_baseline = crate_dir.join("Cargo.toml.baseline");
+    let cargo_toml_baseline = ctx.crate_dir.join("Cargo.toml.baseline");
     if cargo_toml_baseline.exists() {
         let _ = fs::remove_file(&cargo_toml_baseline).await;
     }
@@ -941,13 +862,7 @@ struct UpgradeExperimentSummary {
 
 /// 逐依赖、逐版本执行 `cargo update --precise` 后再编译验证，只记录 update 成功但 verify 失败的 target_version。
 async fn run_stepwise_upgrade_experiments(
-    db: &PgDataHandle,
-    crate_id: i32,
-    crate_name: &str,
-    crate_dir: &Path,
-    cargo_home: &Path,
-    target_dir: &Path,
-    cargo_cmd_semaphore: &Semaphore,
+    ctx: CompileCtx<'_>,
     deps_by_kind: &IndexDepsByKind,
 ) -> anyhow::Result<UpgradeExperimentSummary> {
     let deps = flatten_index_deps(deps_by_kind);
@@ -971,7 +886,7 @@ async fn run_stepwise_upgrade_experiments(
             }
         };
 
-        let version = match get_available_versions(db, &dep.name, &version_req).await {
+        let version = match get_available_versions(ctx.db, &dep.name, &version_req).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
@@ -986,14 +901,14 @@ async fn run_stepwise_upgrade_experiments(
         let Some(version) = version else {
             continue;
         };
-        restore_baseline_project_state(crate_dir).await?;
+        restore_baseline_project_state(ctx.crate_dir).await?;
 
         let update_ok = cargo_update_precise(
-            crate_id,
-            crate_name,
-            crate_dir,
-            cargo_home,
-            cargo_cmd_semaphore,
+            ctx.crate_id,
+            ctx.crate_name,
+            ctx.crate_dir,
+            ctx.cargo_home,
+            ctx.cargo_cmd_semaphore,
             &dep.name,
             &version,
         )
@@ -1009,18 +924,7 @@ async fn run_stepwise_upgrade_experiments(
             continue;
         }
 
-        let verify_ok = verify_after_update(
-            crate_id,
-            crate_name,
-            crate_dir,
-            cargo_home,
-            target_dir,
-            cargo_cmd_semaphore,
-            &dep.dep_type,
-            &dep.name,
-            &version,
-        )
-        .await?;
+        let verify_ok = verify_after_update(ctx, &dep.dep_type, &dep.name, &version).await?;
 
         if verify_ok {
             continue;
@@ -1038,10 +942,9 @@ async fn run_stepwise_upgrade_experiments(
         if let Some(arr) = entry
             .get_mut("failed_targets")
             .and_then(|v| v.as_array_mut())
+            && !arr.iter().any(|v| v.as_str() == Some(&version))
         {
-            if !arr.iter().any(|v| v.as_str() == Some(&version)) {
-                arr.push(serde_json::Value::String(version));
-            }
+            arr.push(serde_json::Value::String(version));
         }
     }
 
@@ -1134,34 +1037,33 @@ async fn cargo_update_precise(
 
 /// 更新依赖后执行编译验证：normal/build 跑 build，dev 跑 test+bench（均使用 --locked）
 async fn verify_after_update(
-    crate_id: i32,
-    crate_name: &str,
-    crate_dir: &Path,
-    cargo_home: &Path,
-    target_dir: &Path,
-    cargo_cmd_semaphore: &Semaphore,
+    ctx: CompileCtx<'_>,
     dep_type: &DepType,
     dep_name: &str,
     target_version: &str,
 ) -> anyhow::Result<bool> {
     match dep_type {
         DepType::Normal | DepType::Build => {
-            let _permit =
-                acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "verify_build")
-                    .await?;
+            let _permit = acquire_cargo_cmd_permit(
+                ctx.cargo_cmd_semaphore,
+                ctx.crate_id,
+                ctx.crate_name,
+                "verify_build",
+            )
+            .await?;
             let build_start = Instant::now();
             let status = run_cargo_status_timeout(
-                crate_id,
-                crate_name,
+                ctx.crate_id,
+                ctx.crate_name,
                 "verify_build_spawned",
                 "verify_build_timeout",
                 CARGO_CMD_TIMEOUT_SECS,
                 {
                     let mut cmd = TokioCommand::new("cargo");
                     cmd.args(["+1.95.0", "build", "--locked"])
-                        .current_dir(crate_dir)
-                        .env("CARGO_HOME", cargo_home)
-                        .env("CARGO_TARGET_DIR", target_dir)
+                        .current_dir(ctx.crate_dir)
+                        .env("CARGO_HOME", ctx.cargo_home)
+                        .env("CARGO_TARGET_DIR", ctx.target_dir)
                         .env("CARGO_INCREMENTAL", "0")
                         .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                     cmd
@@ -1170,9 +1072,9 @@ async fn verify_after_update(
             .await?;
             let ok = status.success();
             tracing::info!(
-                crate_id,
-                crate_name = %crate_name,
-                crate_dir = %crate_dir.display(),
+                crate_id = ctx.crate_id,
+                crate_name = %ctx.crate_name,
+                crate_dir = %ctx.crate_dir.display(),
                 dep_name = %dep_name,
                 target_version = %target_version,
                 ok,
@@ -1183,22 +1085,26 @@ async fn verify_after_update(
             Ok(ok)
         }
         DepType::Dev => {
-            let _permit =
-                acquire_cargo_cmd_permit(cargo_cmd_semaphore, crate_id, crate_name, "verify_dev")
-                    .await?;
+            let _permit = acquire_cargo_cmd_permit(
+                ctx.cargo_cmd_semaphore,
+                ctx.crate_id,
+                ctx.crate_name,
+                "verify_dev",
+            )
+            .await?;
             let test_start = Instant::now();
             let test_status = run_cargo_status_timeout(
-                crate_id,
-                crate_name,
+                ctx.crate_id,
+                ctx.crate_name,
                 "verify_test_spawned",
                 "verify_test_timeout",
                 CARGO_CMD_TIMEOUT_SECS,
                 {
                     let mut cmd = TokioCommand::new("cargo");
                     cmd.args(["+1.95.0", "test", "--no-run", "--locked"])
-                        .current_dir(crate_dir)
-                        .env("CARGO_HOME", cargo_home)
-                        .env("CARGO_TARGET_DIR", target_dir)
+                        .current_dir(ctx.crate_dir)
+                        .env("CARGO_HOME", ctx.cargo_home)
+                        .env("CARGO_TARGET_DIR", ctx.target_dir)
                         .env("CARGO_INCREMENTAL", "0")
                         .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                     cmd
@@ -1207,9 +1113,9 @@ async fn verify_after_update(
             .await?;
             let test_ok = test_status.success();
             tracing::info!(
-                crate_id,
-                crate_name = %crate_name,
-                crate_dir = %crate_dir.display(),
+                crate_id = ctx.crate_id,
+                crate_name = %ctx.crate_name,
+                crate_dir = %ctx.crate_dir.display(),
                 dep_name = %dep_name,
                 target_version = %target_version,
                 ok = test_ok,
@@ -1223,17 +1129,17 @@ async fn verify_after_update(
 
             let bench_start = Instant::now();
             let bench_status = run_cargo_status_timeout(
-                crate_id,
-                crate_name,
+                ctx.crate_id,
+                ctx.crate_name,
                 "verify_bench_spawned",
                 "verify_bench_timeout",
                 CARGO_CMD_TIMEOUT_SECS,
                 {
                     let mut cmd = TokioCommand::new("cargo");
                     cmd.args(["+1.95.0", "bench", "--no-run", "--locked"])
-                        .current_dir(crate_dir)
-                        .env("CARGO_HOME", cargo_home)
-                        .env("CARGO_TARGET_DIR", target_dir)
+                        .current_dir(ctx.crate_dir)
+                        .env("CARGO_HOME", ctx.cargo_home)
+                        .env("CARGO_TARGET_DIR", ctx.target_dir)
                         .env("CARGO_INCREMENTAL", "0")
                         .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
                     cmd
@@ -1242,9 +1148,9 @@ async fn verify_after_update(
             .await?;
             let ok = bench_status.success();
             tracing::info!(
-                crate_id,
-                crate_name = %crate_name,
-                crate_dir = %crate_dir.display(),
+                crate_id = ctx.crate_id,
+                crate_name = %ctx.crate_name,
+                crate_dir = %ctx.crate_dir.display(),
                 dep_name = %dep_name,
                 target_version = %target_version,
                 ok,
@@ -1317,10 +1223,10 @@ async fn get_available_versions_via_api(crate_name: &str) -> anyhow::Result<Vec<
     if let Some(versions_array) = json.get("versions").and_then(|v| v.as_array()) {
         for v in versions_array {
             // 跳过 yanked 版本
-            if let Some(yanked) = v.get("yanked").and_then(|y| y.as_bool()) {
-                if yanked {
-                    continue;
-                }
+            if let Some(yanked) = v.get("yanked").and_then(|y| y.as_bool())
+                && yanked
+            {
+                continue;
             }
             if let Some(num) = v.get("num").and_then(|n| n.as_str()) {
                 versions.push(num.to_string());

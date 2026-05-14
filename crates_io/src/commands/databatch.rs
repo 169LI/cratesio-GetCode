@@ -554,7 +554,7 @@ fn parse_crates_datetime(raw: &str) -> Option<NaiveDateTime> {
     s = s.replace(".-1f", "");
 
     if let Some((sign_idx, sign)) = s
-        .rfind(|c| c == '+' || c == '-')
+        .rfind(['+', '-'])
         .map(|idx| (idx, s.as_bytes()[idx] as char))
     {
         let tz_part = &s[sign_idx + 1..];
@@ -565,10 +565,9 @@ fn parse_crates_datetime(raw: &str) -> Option<NaiveDateTime> {
         }
     }
 
-    let dt = DateTime::parse_from_str(&s, "%d/%m/%Y %H:%M:%S%z")
+    DateTime::parse_from_str(&s, "%d/%m/%Y %H:%M:%S%z")
         .ok()
-        .map(|dt: DateTime<FixedOffset>| dt.with_timezone(&Utc).naive_utc());
-    dt
+        .map(|dt: DateTime<FixedOffset>| dt.with_timezone(&Utc).naive_utc())
 }
 
 fn load_latest_versions(data_txt: &Path) -> anyhow::Result<HashMap<String, String>> {

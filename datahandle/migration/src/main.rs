@@ -2,7 +2,7 @@
 //! -
 //! 这是 `datahandle-migration` 的入口程序，用于执行 SeaORM 的数据库迁移，并在需要时自动生成/更新
 //! `datahandle/src/entities` 下的实体代码。
-//! 
+//!
 //! **注意**
 //! 如果每次拉取代码的时候发现有新的迁移文件，务必手动执行 `cargo run -- up` 来应用迁移
 //!
@@ -54,7 +54,6 @@
 //!  Features2: 功能信息(JSON 格式)
 //!  Pubtime: 发布时间
 //!
-
 
 use dotenvy::dotenv;
 use sea_orm_migration::prelude::*;

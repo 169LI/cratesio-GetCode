@@ -69,10 +69,7 @@ fn get_crate_extract_dir(crate_file_path: &Path) -> PathBuf {
 ///
 /// 这类错误重试无意义，需要保证临时目录与目标目录在同一文件系统/挂载点。
 fn is_cross_device_rename_error(err: &std::io::Error) -> bool {
-    match err.raw_os_error() {
-        Some(18) => true,
-        _ => false,
-    }
+    matches!(err.raw_os_error(), Some(18))
 }
 
 /// 判断当前 rename 失败是否值得重试（偏向处理临时占用/短暂异常）。
@@ -90,18 +87,12 @@ fn should_retry_rename_error(err: &std::io::Error) -> bool {
         return true;
     }
 
-    match err.raw_os_error() {
-        Some(5 | 1 | 4 | 13 | 16 | 26) => true,
-        _ => false,
-    }
+    matches!(err.raw_os_error(), Some(5 | 1 | 4 | 13 | 16 | 26))
 }
 
 /// 判断 rename 失败是否可能因为“目标目录已存在/非空”，适合先清理目标再重试。
 fn should_remove_target_then_retry(err: &std::io::Error) -> bool {
-    match err.raw_os_error() {
-        Some(17 | 39) => true,
-        _ => false,
-    }
+    matches!(err.raw_os_error(), Some(17 | 39))
 }
 
 /// 以指数退避对目录重命名（move）进行重试，提升 Windows/Linux 下的鲁棒性。
@@ -341,11 +332,11 @@ pub async fn download_run(db: &PgDataHandle, download_dir: &Path) -> anyhow::Res
 
                 let file_path = get_crate_file_path(&download_dir, crate_name, version);
 
-                if let Some(parent) = file_path.parent() {
-                    if let Err(e) = fs::create_dir_all(parent).await {
-                        tracing::error!(error = ?e, "Failed to create directory {:?}", parent);
-                        return;
-                    }
+                if let Some(parent) = file_path.parent()
+                    && let Err(e) = fs::create_dir_all(parent).await
+                {
+                    tracing::error!(error = ?e, "Failed to create directory {:?}", parent);
+                    return;
                 }
 
                 for attempt in 1..=MAX_ATTEMPTS {
@@ -374,27 +365,27 @@ pub async fn download_run(db: &PgDataHandle, download_dir: &Path) -> anyhow::Res
                             return;
                         }
                         Err(e) => {
-                            if let Some(status_err) = e.downcast_ref::<HttpStatusError>() {
-                                if is_permanent_http_status(status_err.status) {
-                                    tracing::warn!(
-                                        attempt,
-                                        max_attempts = MAX_ATTEMPTS,
-                                        error = ?e,
-                                        "crate {} v{} failed (permanent)",
-                                        crate_name,
-                                        version
+                            if let Some(status_err) = e.downcast_ref::<HttpStatusError>()
+                                && is_permanent_http_status(status_err.status)
+                            {
+                                tracing::warn!(
+                                    attempt,
+                                    max_attempts = MAX_ATTEMPTS,
+                                    error = ?e,
+                                    "crate {} v{} failed (permanent)",
+                                    crate_name,
+                                    version
+                                );
+
+                                if let Err(db_err) = db.mark_crate_download_failed(id).await {
+                                    tracing::error!(
+                                        error = ?db_err,
+                                        "failed to mark crate {} as download_failed",
+                                        id
                                     );
-
-                                    if let Err(db_err) = db.mark_crate_download_failed(id).await {
-                                        tracing::error!(
-                                            error = ?db_err,
-                                            "failed to mark crate {} as download_failed",
-                                            id
-                                        );
-                                    }
-
-                                    return;
                                 }
+
+                                return;
                             }
 
                             tracing::warn!(
