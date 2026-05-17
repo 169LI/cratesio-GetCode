@@ -23,6 +23,14 @@ use tracing_subscriber::prelude::*;
 
 static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
+/// 作用
+/// -
+///- 尝试加载根目录
+/// 
+/// 步骤
+/// -
+/// - 尝试加载根目录
+/// -建两个layer
 pub fn init_logging() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_env = manifest_dir.parent().unwrap_or(&manifest_dir).join(".env");

@@ -58,6 +58,16 @@ pub async fn batch_run(db: &PgDataHandle, cli: &DataBatchCli) -> anyhow::Result<
     Ok(())
 }
 
+/// 作用
+/// -
+/// - 批量处理 crate.io_index提供的版本数据填充到数据库
+///
+/// 步骤
+/// -
+/// - 从 `CRATESIO_INDEX_DIR` 读取 crate_versions_index.json
+/// - 解析 JSON 数据
+/// - 插入到 `crate_versions_index` 表
+///
 async fn precompile_skip_no_deps(db: &PgDataHandle) -> anyhow::Result<()> {
     tracing::info!(
         stage = "precompile_skip_no_deps_start",
@@ -246,6 +256,9 @@ async fn handle_version(db: &PgDataHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 作用
+/// -
+/// - 处理单个 crate 版本索引，包括重试机制和超时处理。
 async fn handle_single_crate_version_with_retry_and_timeout(
     db: &PgDataHandle,
     index_root: &Path,
@@ -307,6 +320,9 @@ async fn handle_single_crate_version_with_retry_and_timeout(
     Err(anyhow::anyhow!("unreachable"))
 }
 
+/// 作用
+/// -
+/// - 处理单个 crate 版本索引，包括重试机制和超时处理。
 async fn process_single_crate_version_with_index_root(
     db: &PgDataHandle,
     index_root: &Path,
@@ -371,6 +387,9 @@ pub async fn parse_crate_versions_from_file(
     Ok(rows)
 }
 
+/// 作用
+/// -
+/// - 解析 crate.io_index.json 中的一条记录，提取版本、依赖、特征和发布时间。并提取最小字段
 fn parse_index_version_line(line: &str) -> anyhow::Result<Option<ParsedCrateVersionRow>> {
     let value: Value = serde_json::from_str(line).context("failed to parse index json line")?;
     let version = match value.get("vers").and_then(Value::as_str) {

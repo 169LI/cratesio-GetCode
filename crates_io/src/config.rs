@@ -17,12 +17,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+///保证配置只初始化一次，后续服用同一份快照
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub env: HashMap<String, String>,
 }
+
 
 impl Config {
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -35,7 +37,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("missing env: {}", key))
     }
 }
-
+///初始化一次，并返回全局只读配置引用
+/// 依次尝试加载env
 pub fn get_config_once() -> anyhow::Result<&'static Config> {
     if let Some(config) = CONFIG.get() {
         return Ok(config);
@@ -77,6 +80,7 @@ pub fn get_config_once() -> anyhow::Result<&'static Config> {
     Ok(CONFIG.get().expect("config must be initialized"))
 }
 
+///单测时验证 DOWNLOAD_DIR 、 CRATESIO_INDEX_DIR 这些路径存在且是目录，提前发现环境没配好。
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

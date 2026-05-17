@@ -24,6 +24,9 @@ use sea_orm::{
     QueryOrder, QuerySelect,
 };
 
+/// 作用
+/// -
+/// - 导入 crates 表时用的“行数据 DTO”
 #[derive(Debug, Clone)]
 pub struct CrateImportRow {
     pub id: i32,
@@ -38,6 +41,9 @@ pub struct CrateImportRow {
     pub version_handled: bool,
 }
 
+/// 作用
+/// -
+/// - 导入 crate_versions_index 表时用的 DTO。
 #[derive(Debug, Clone)]
 pub struct CrateVersionIndexRow {
     pub crate_id: i32,
@@ -47,6 +53,10 @@ pub struct CrateVersionIndexRow {
     pub pubtime: Option<sea_orm::prelude::DateTime>,
 }
 
+/// 作用
+/// -
+/// - 数据库连接句柄封装，提供可复用的数据库连接。便于并发任务共享一个连接池
+///
 #[derive(Clone, Debug)]
 pub struct PgDataHandle {
     pub connection: Arc<DatabaseConnection>,

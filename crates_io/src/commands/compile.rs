@@ -43,6 +43,9 @@ async fn cleanup_dir_contents(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 作用
+/// -
+/// - 运行 cargo 命令，设置超时时间。进行统一封装
 async fn run_cargo_status_timeout(
     crate_id: i32,
     crate_name: &str,
@@ -138,6 +141,9 @@ async fn ensure_rust_toolchain(toolchain: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// 作用
+// -
+// - 从 cargo 命令信号量中获取一个许可，确保并发数不超过最大限制。避免一个crate内多个cargo同时跑
 async fn acquire_cargo_cmd_permit<'a>(
     cargo_cmd_semaphore: &'a Semaphore,
     crate_id: i32,
@@ -429,6 +435,9 @@ pub async fn compile_run(db: &PgDataHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+///作用
+/// -
+/// - 实现主要产物清理，避免编译产物累计
 async fn cargo_clean(
     crate_id: i32,
     crate_name: &str,
